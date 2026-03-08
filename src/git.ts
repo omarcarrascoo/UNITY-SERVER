@@ -6,8 +6,8 @@ import { WORKSPACE_DIR, TARGET_REPO_PATH } from './config.js';
 
 const execPromise = util.promisify(exec);
 
-// 🧠 Ruta dinámica que nuestro escáner descubrirá
 export let TARGET_EXPO_PATH = TARGET_REPO_PATH;
+export let TARGET_API_PATH: string | null = null; // 🧠 NUEVO: Memoria para la ubicación del backend
 
 export async function prepareWorkspace(): Promise<void> {
     if (!fs.existsSync(WORKSPACE_DIR)) fs.mkdirSync(WORKSPACE_DIR);
@@ -32,7 +32,6 @@ async function autoDetectAndInstall(basePath: string) {
     console.log(`📦 Scanning architecture in ${basePath}...`);
     let isSingleRepo = false;
 
-    // 1. Check Root (Single Repo)
     if (fs.existsSync(path.join(basePath, 'package.json'))) {
         const pkg = JSON.parse(fs.readFileSync(path.join(basePath, 'package.json'), 'utf8'));
         if (pkg.dependencies?.expo || pkg.devDependencies?.expo) {
@@ -43,7 +42,6 @@ async function autoDetectAndInstall(basePath: string) {
         }
     }
 
-    // 2. Check Subdirectories (Monorepo)
     if (!isSingleRepo) {
         console.log(`⚙️ Monorepo detected. Scanning modules...`);
         const items = fs.readdirSync(basePath, { withFileTypes: true });
@@ -55,10 +53,17 @@ async function autoDetectAndInstall(basePath: string) {
                     await execPromise(`npm install`, { cwd: subDir });
 
                     const pkg = JSON.parse(fs.readFileSync(path.join(subDir, 'package.json'), 'utf8'));
-                    // Detectamos si la carpeta es la de Expo por dependencias o por nombre (expo-*)
+                    
+                    // Detectar Frontend (Expo)
                     if (pkg.dependencies?.expo || pkg.devDependencies?.expo || item.name.startsWith('expo-')) {
                         console.log(`🚀 Expo App located at: ${subDir}`);
                         TARGET_EXPO_PATH = subDir;
+                    }
+                    
+                    // 🧠 Detectar Backend (NestJS)
+                    if (pkg.dependencies?.['@nestjs/core'] || item.name.includes('api') || item.name.includes('infra')) {
+                        console.log(`🔌 NestJS API located at: ${subDir}`);
+                        TARGET_API_PATH = subDir;
                     }
                 }
             }

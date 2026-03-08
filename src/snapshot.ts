@@ -1,16 +1,32 @@
+import fs from 'fs';
 import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import puppeteer from 'puppeteer';
+import os from 'os';
 import { WORKSPACE_DIR } from './config.js';
-import { TARGET_EXPO_PATH } from './git.js';
+import { TARGET_EXPO_PATH, TARGET_API_PATH } from './git.js';
 
-// 🧠 REFERENCIA GLOBAL
 let currentExpoProcess: ChildProcess | null = null;
+let currentNestProcess: ChildProcess | null = null;
+let currentNgrokProcess: ChildProcess | null = null;
 
 export interface SnapshotResult {
     snapshotPath: string | null;
-    liveUrl: string;
+    publicUrl: string | null;
+    localUrl: string;
     warning?: string;
+}
+
+function getLocalIpAddress(): string | null {
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+        for (const iface of interfaces[name] || []) {
+            if (iface.family === 'IPv4' && !iface.internal) {
+                return iface.address;
+            }
+        }
+    }
+    return null;
 }
 
 export async function takeSnapshot(targetRoute: string = '/'): Promise<SnapshotResult> {
@@ -20,57 +36,105 @@ export async function takeSnapshot(targetRoute: string = '/'): Promise<SnapshotR
 
     const snapshotPath = path.join(WORKSPACE_DIR, 'snapshot.png');
     const port = 8081;
+    const localUrl = `http://localhost:${port}${safeRoute}`;
+    const ip = getLocalIpAddress();
+    const mobileUrl = ip ? `http://${ip}:${port}${safeRoute}` : null;
 
     console.log(`📸 Requested route: ${targetRoute}`);
 
-    if (currentExpoProcess) {
-        console.log("🛑 Killing previous Expo server to free up port...");
-        currentExpoProcess.kill();
-        currentExpoProcess = null;
-        await new Promise(r => setTimeout(r, 2000)); 
+    if (currentExpoProcess) currentExpoProcess.kill();
+    if (currentNestProcess) currentNestProcess.kill();
+    if (currentNgrokProcess) currentNgrokProcess.kill();
+    await new Promise(r => setTimeout(r, 2000)); 
+
+    let backendNgrokUrl: string | null = null;
+    
+    // ⚡ PASO 1: LEVANTAR BACKEND Y NGROK
+    if (TARGET_API_PATH) {
+        console.log("🔌 Starting NestJS Backend...");
+        currentNestProcess = spawn('npm', ['run', 'start'], { cwd: TARGET_API_PATH, shell: true });
+        
+        console.log("🚇 Opening Ngrok Tunnel for Backend (Port 3000)...");
+        // Agregamos --yes para evitar que npx se quede colgado preguntando "Need to install ngrok? (y/n)"
+        currentNgrokProcess = spawn('npx', ['--yes', 'ngrok', 'http', '3000', '--log=stdout'], { shell: true });
+        
+        await new Promise<void>((resolveBackend) => {
+            let isBackendResolved = false;
+
+            const processNgrokOutput = (data: any) => {
+                const output = data.toString();
+                
+                // 👁️ RAYOS X: Imprimimos la terminal de Ngrok para ver posibles errores
+                if (output.trim()) {
+                    console.log(`[NGROK LOG] ${output.trim()}`);
+                }
+                
+                // Regex permisivo para atrapar la URL en el log de ngrok
+                const match = output.match(/url=(https:\/\/[a-zA-Z0-9-]+\.ngrok[^\s]*)/i);
+                
+                if (match && !backendNgrokUrl && !isBackendResolved) {
+                    backendNgrokUrl = match[1];
+                    console.log(`✅ Backend Tunnel Ready: ${backendNgrokUrl}`);
+                    
+                    const envPath = path.join(TARGET_EXPO_PATH, '.env');
+                    let envContent = '';
+                    if (fs.existsSync(envPath)) {
+                        envContent = fs.readFileSync(envPath, 'utf8');
+                    }
+                    
+                    envContent = envContent.replace(/^EXPO_PUBLIC_API_URL=.*$/gm, '').trim();
+                    envContent += `\nEXPO_PUBLIC_API_URL=${backendNgrokUrl}\n`;
+                    fs.writeFileSync(envPath, envContent.trim() + '\n');
+                    console.log(`💉 Injected EXPO_PUBLIC_API_URL into Expo App`);
+                    
+                    isBackendResolved = true;
+                    resolveBackend();
+                }
+            };
+
+            // Escuchamos ambos canales de la terminal
+            currentNgrokProcess?.stdout?.on('data', processNgrokOutput);
+            currentNgrokProcess?.stderr?.on('data', processNgrokOutput);
+
+            setTimeout(() => {
+                if (!isBackendResolved) {
+                    console.log("⚠️ Ngrok backend tunnel timeout. Continuing without it...");
+                    isBackendResolved = true;
+                    resolveBackend();
+                }
+            }, 15000);
+        });
     }
 
+    // ⚡ PASO 2: LEVANTAR EXPO FRONTEND
     return new Promise((resolve) => {
-        console.log("🚀 Starting new Expo server with Tunnel...");
+        console.log("🚀 Starting new Expo Web Server...");
         
-        currentExpoProcess = spawn('npx', ['expo', 'start', '--web', '--tunnel', '--port', port.toString()], {
+        currentExpoProcess = spawn('npx', ['expo', 'start', '--web', '--port', port.toString()], {
             cwd: TARGET_EXPO_PATH,
             shell: true
         });
 
         let isResolved = false;
-        let tunnelUrl = ''; 
-        let localUrlReady = false;
+        let serverReady = false;
 
-        currentExpoProcess.stdout?.on('data', (data) => {
-            const output = data.toString();
-
-            // Descomenta la siguiente línea si quieres ver en tu terminal todo lo que Expo hace por detrás
-            // console.log(`[EXPO] ${output.trim()}`); 
-
-            if (output.includes('http://localhost')) {
-                localUrlReady = true;
+        const processOutput = (data: any) => {
+            const rawString = data.toString();
+            if (rawString.includes('http://localhost') || rawString.includes('Web is waiting on') || rawString.includes('ready in')) {
+                serverReady = true;
             }
+        };
 
-            // 🕵️‍♂️ Regex ampliado para atrapar cualquier formato de ngrok o localtunnel
-            const tunnelMatch = output.match(/https:\/\/[a-zA-Z0-9-]+\.(ngrok-free\.app|ngrok\.io|ngrok-free\.dev|loca\.lt|exp\.direct)/);
-            if (tunnelMatch && !tunnelUrl) {
-                tunnelUrl = tunnelMatch[0];
-                console.log(`🌍 Public Tunnel URL detected: ${tunnelUrl}`);
-            }
-        });
+        currentExpoProcess.stdout?.on('data', processOutput);
+        currentExpoProcess.stderr?.on('data', processOutput);
 
-        // 🔄 POLLING: Revisamos cada segundo si AMBAS URLs ya existen
         const checkInterval = setInterval(async () => {
-            if (localUrlReady && tunnelUrl && !isResolved) {
+            if (serverReady && !isResolved) {
                 isResolved = true;
                 clearInterval(checkInterval);
                 
                 try {
-                    const localUrl = `http://localhost:${port}${safeRoute}`;
-                    const finalLiveUrl = `${tunnelUrl}${safeRoute}`; // 👈 Esta es la que va a Discord
-                    
-                    console.log(`🌐 Expo tunnel ready. Taking snapshot via local port...`);
+                    console.log(`🌐 Expo Server ready! Taking snapshot...`);
                     const browser = await puppeteer.launch({ headless: true });
                     const page = await browser.newPage();
                     await page.setViewport({ width: 390, height: 844, isMobile: true });
@@ -79,40 +143,20 @@ export async function takeSnapshot(targetRoute: string = '/'): Promise<SnapshotR
                     await page.screenshot({ path: snapshotPath });
                     await browser.close();
                     
-                    resolve({ snapshotPath, liveUrl: finalLiveUrl });
+                    resolve({ snapshotPath, publicUrl: mobileUrl, localUrl });
                 } catch (error: any) {
-                    console.log("⚠️ Puppeteer failed, returning live URL only...");
-                    resolve({ snapshotPath: null, liveUrl: `${tunnelUrl}${safeRoute}`, warning: `Snapshot failed: ${error.message}` });
+                    console.log(`⚠️ Puppeteer failed: ${error.message}`);
+                    resolve({ snapshotPath: null, publicUrl: mobileUrl, localUrl, warning: `Snapshot failed: ${error.message}` });
                 }
             }
         }, 1000);
 
-        // ⏱️ TIMEOUT (Si ngrok falla o tarda más de 45 segundos)
         setTimeout(async () => {
             if (!isResolved) {
                 isResolved = true;
                 clearInterval(checkInterval);
-                const fallbackUrl = tunnelUrl ? `${tunnelUrl}${safeRoute}` : `http://localhost:${port}${safeRoute}`;
-                
-                console.log(`⚠️ Tunnel timeout. Falling back to: ${fallbackUrl}`);
-                
-                if (localUrlReady) {
-                    // Si al menos localhost funciona, intentamos mandar la foto
-                    try {
-                        const browser = await puppeteer.launch({ headless: true });
-                        const page = await browser.newPage();
-                        await page.goto(`http://localhost:${port}${safeRoute}`, { waitUntil: 'networkidle2', timeout: 15000 });
-                        await page.screenshot({ path: snapshotPath });
-                        await browser.close();
-                        resolve({ snapshotPath, liveUrl: fallbackUrl, warning: tunnelUrl ? undefined : "⚠️ Ngrok tunnel failed to start. Link is local only." });
-                    } catch(e) {
-                        resolve({ snapshotPath: null, liveUrl: fallbackUrl, warning: "Tunnel & Puppeteer failed." });
-                    }
-                } else {
-                    if (currentExpoProcess) currentExpoProcess.kill();
-                    resolve({ snapshotPath: null, liveUrl: fallbackUrl, warning: "Expo failed to start." });
-                }
+                resolve({ snapshotPath: null, publicUrl: mobileUrl, localUrl, warning: "⚠️ Server start timeout." });
             }
-        }, 120000); // 120 segundos máximo de espera
+        }, 30000); 
     });
 }

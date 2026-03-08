@@ -2,19 +2,10 @@ import OpenAI from 'openai';
 import fs from 'fs';
 import path from 'path';
 import { TARGET_REPO_PATH } from './config.js';
-import { agentTools, readFile, searchProject } from './tools.js';
+import { agentTools, readFile, searchProject, runCommand } from './tools.js'; 
 
-export interface FileEdit {
-  filepath: string;
-  search: string;
-  replace: string;
-}
-
-export interface AIResponse {
-  targetRoute: string;
-  commitMessage: string;
-  edits: FileEdit[];
-}
+export interface FileEdit { filepath: string; search: string; replace: string; }
+export interface AIResponse { targetRoute: string; commitMessage: string; edits: FileEdit[]; }
 
 const REPO_PATTERNS = `
 REPOSITORY OVERVIEW
@@ -52,7 +43,9 @@ USER OBJECTIVE
 TOOL USAGE CONTRACT
 1) Inspect files with 'read_file' before editing.
 2) Use 'search_project' to find unknown components.
-3) CRITICAL: Before calling a tool, you MUST write a brief 1-2 sentence explanation of your thought process in the message content (e.g., "I need to find the notification component, I will search for it first.").
+3) Use 'run_command' ONLY to execute system/dependency commands (e.g., "cd app-folder && npm install package-name" or "npx tsc"). 
+4) CRITICAL RULE: DO NOT use 'run_command' to create or modify code files (no 'touch', 'echo', or 'cat'). All file creations and modifications MUST be done via the FINAL OUTPUT JSON.
+5) Before calling a tool, you MUST write a brief 1-2 sentence explanation of your thought process in the message content.
 
 FINAL OUTPUT CONTRACT (STRICT)
 - Return exactly ONE valid JSON object.
@@ -97,7 +90,7 @@ export async function generateAndWriteCode(
   userPrompt: string,
   figmaData: string | null,
   projectTree: string,
-  onStatusUpdate?: (status: string, thought?: string) => void // 👈 Añadimos el thought al callback
+  onStatusUpdate?: (status: string, thought?: string) => void
 ): Promise<{ targetRoute: string; commitMessage: string; tokenUsage: number }> {
   
   const openai = new OpenAI({ baseURL: 'https://api.deepseek.com', apiKey: process.env.DEEPSEEK_API_KEY as string });
@@ -133,7 +126,6 @@ export async function generateAndWriteCode(
 
     messages.push(message);
 
-    // 🧠 EXTRAEMOS EL PENSAMIENTO DE LA IA
     const agentThought = message.content ? message.content.trim() : "";
 
     if (message.tool_calls?.length) {
@@ -143,16 +135,17 @@ export async function generateAndWriteCode(
 
         try {
           const args = JSON.parse(toolCall.function.arguments || '{}');
-          const toolMsg = `🛠️ Executing: ${functionName} -> ${args.filepath || args.keyword}`;
+          const toolMsg = `🛠️ Executing: ${functionName} -> ${args.filepath || args.keyword || args.cmd}`;
           console.log(toolMsg);
           
-          // 👈 Pasamos el estado Y el pensamiento al callback
           if (onStatusUpdate) onStatusUpdate(toolMsg, agentThought);
 
           if (functionName === 'read_file') {
             toolResult = readFile(args.filepath, args.startLine, args.endLine);
           } else if (functionName === 'search_project') {
             toolResult = searchProject(args.keyword, args.maxResults);
+          } else if (functionName === 'run_command') {
+            toolResult = await runCommand(args.cmd);
           }
         } catch (error: any) {
           toolResult = `Tool error: ${error.message}`;
@@ -168,7 +161,6 @@ export async function generateAndWriteCode(
       const candidate = extractJsonObject(modelText);
       finalResult = JSON.parse(candidate) as AIResponse;
       
-      // Si antes de darnos el JSON tuvo un pensamiento final, lo mostramos
       if (agentThought && onStatusUpdate) {
           onStatusUpdate(`✅ Preparing final code delivery...`, agentThought);
       }
@@ -182,7 +174,6 @@ export async function generateAndWriteCode(
 
   if (onStatusUpdate) onStatusUpdate(`✅ Code ready! Applying surgical edits...`);
 
-  // ✂️ APLICANDO EDICIÓN QUIRÚRGICA
   for (const edit of finalResult.edits || []) {
     if (!edit.filepath) continue;
     const fullPath = resolveSafeFilePath(edit.filepath);
@@ -190,7 +181,7 @@ export async function generateAndWriteCode(
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
     if (!fs.existsSync(fullPath) || edit.search.trim() === "") {
-        fs.writeFileSync(fullPath, edit.replace, 'utf8'); // Archivo nuevo
+        fs.writeFileSync(fullPath, edit.replace, 'utf8'); 
         continue;
     }
 

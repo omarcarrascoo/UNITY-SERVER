@@ -23,7 +23,6 @@ client.on('messageCreate', async (message: Message) => {
         : '🤖 Acknowledged. Preparing a fresh workspace...'
     );
 
-    // 🧵 CREAMOS EL HILO EN EL MENSAJE DEL USUARIO
     const threadName = message.content.length > 20 
         ? `🧠 Jarvis Logs - ${message.content.substring(0, 20)}...` 
         : `🧠 Jarvis Logs - ${message.content}`;
@@ -47,16 +46,13 @@ client.on('messageCreate', async (message: Message) => {
             ? `We are iterating on the current code. Keep the recent changes but apply this correction: "${message.content}"` 
             : message.content;
 
-        // 👁️ Live Feed Callback al Hilo
         const { targetRoute, commitMessage, tokenUsage } = await generateAndWriteCode(
             finalPrompt, figmaData, projectTree,
             async (statusMsg, thought) => {
                 let logMessage = `**${statusMsg}**`;
                 if (thought && thought !== "") {
-                    // Formateamos el pensamiento de la IA como un bloque de cita para que se vea limpio
                     logMessage += `\n> 💭 *${thought.replace(/\n/g, '\n> ')}*`;
                 }
-                // Lo mandamos al hilo en vez de editar el mensaje principal
                 await thread.send(logMessage).catch(() => {});
             }
         );
@@ -65,23 +61,23 @@ client.on('messageCreate', async (message: Message) => {
         sessionStore.set(sessionId, commitMessage);
         
         await thread.send(`📸 Code generated. Navigating to \`${targetRoute}\` to take snapshot...`);
-        const { snapshotPath, liveUrl, warning } = await takeSnapshot(targetRoute);
+        
+        // 👈 Aquí extraemos AMBAS URLs
+        const { snapshotPath, publicUrl, localUrl, warning } = await takeSnapshot(targetRoute);
 
         const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
             new ButtonBuilder().setCustomId(`approve_${sessionId}`).setLabel('✅ Approve & PR').setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId(`reject_${sessionId}`).setLabel('🔄 Reject').setStyle(ButtonStyle.Danger),
         );
 
-        const finalContent = `✨ **Ready!**\n📝 **Commit:** \`${commitMessage}\`\n💰 **Tokens Used:** \`${tokenUsage.toLocaleString()}\`\n🌐 **Live URL:** ${liveUrl}\n${warning ? `⚠️ *${warning}*` : ''}`;
-
-        // El mensaje principal recibe el resultado final
+        // 👈 Aquí imprimimos 🏠 Local y 🌍 Public
+        const finalContent = `✨ **Ready!**\n📝 **Commit:** \`${commitMessage}\`\n💰 **Tokens Used:** \`${tokenUsage.toLocaleString()}\`\n🏠 **Local:** ${localUrl}\n📱 **Mobile (Wi-Fi):** ${publicUrl ? publicUrl : 'Unavailable'}\n${warning ? `\n⚠️ *${warning}*` : ''}`;
         if (snapshotPath) {
             await replyMessage.edit({ content: finalContent, files: [new AttachmentBuilder(snapshotPath)], components: [row] });
         } else {
             await replyMessage.edit({ content: finalContent, components: [row] });
         }
 
-        // Cerramos el hilo suavemente
         await thread.send("✅ Task completed. Archiving thread.");
         await thread.setArchived(true);
 
