@@ -1,5 +1,5 @@
 
-# 🧠 Unity OS (Jarvis)
+# 🧠 Unity OS
 
 > Because sometimes you need to keep shipping without a computer.
 
@@ -198,7 +198,7 @@ These control the active workspace.
 
 ```mermaid
 flowchart TD
-    P[User Prompt] --> F[Figma MCP nodes] --> R[Agent Reasoning]
+    P[User Prompt] --> R[Figma MCP nodes] --> R[Agent Reasoning]
     R --> T[Tool Call]
     T --> C[Tool Result]
     C --> R
