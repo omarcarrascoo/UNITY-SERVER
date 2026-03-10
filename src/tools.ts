@@ -120,7 +120,8 @@ export async function runCommand(cmd: string): Promise<string> {
     const allowedPrefixes = [
         "npm install", "npm uninstall", "npm run", "npm i",
         "npx expo", "npx tsc", "npx eslint", "npx prettier",
-        "cd ", "mkdir", "ls", "pwd", "echo"
+        "cd ", "mkdir", "ls", "pwd", "echo",
+        "git status", "git diff", "git log"
     ];
 
     const subCommands = trimmedCmd.split('&&').map(s => s.trim());
@@ -129,7 +130,7 @@ export async function runCommand(cmd: string): Promise<string> {
         const isAllowed = allowedPrefixes.some(prefix => subCmd.startsWith(prefix));
         if (!isAllowed) {
             console.log(`🚨 SECURITY BLOCK: Unauthorized command attempted: ${subCmd}`);
-            return `🚨 SECURITY EXCEPTION: Command rejected. You are ONLY allowed to run safe development commands (npm, npx, cd, ls, mkdir).`;
+            return `🚨 SECURITY EXCEPTION: Command rejected. You are ONLY allowed to run safe development commands (npm, npx, cd, ls, mkdir, git status/diff/log).`;
         }
     }
 
@@ -181,7 +182,7 @@ export const agentTools: any[] = [
     type: 'function',
     function: {
       name: 'run_command',
-      description: 'Executes a bash shell command in the repository root. Use this to install missing npm packages (e.g., "npm install dayjs") or run linters/compilers (e.g., "npx tsc --noEmit") to check for errors. Note: To install in a sub-folder of a monorepo, use cd (e.g., "cd kubo-mobile && npm install lucide-react-native").',
+      description: 'Executes a bash shell command in the repository root. Use this to install missing npm packages (e.g., "npm install dayjs"), run linters/compilers (e.g., "npx tsc --noEmit"), or check git history (e.g., "git status" or "git diff"). Note: To install in a sub-folder of a monorepo, use cd (e.g., "cd kubo-mobile && npm install lucide-react-native").',
       parameters: {
         type: 'object',
         properties: {

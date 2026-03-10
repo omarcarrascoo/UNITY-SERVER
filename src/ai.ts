@@ -36,7 +36,6 @@ function buildSystemPrompt(userPrompt: string, figmaData: string | null, project
     ? `\n\n### 🧠 STRICT PROJECT RULES (.unityrc.md) 🧠\nYou MUST strictly follow these architectural rules for this project:\n${projectMemory}\n` 
     : '';
 
-  // 🧠 DE VUELTA: Inyectamos el diff actual si estamos en una iteración
   const diffInstructions = currentDiff 
     ? `\n\n### 📝 UNCOMMITTED CHANGES (SHORT-TERM MEMORY) 📝\nYou are in an iteration. You have ALREADY made the following changes in this session. DO NOT undo them unless explicitly asked. Use this as context for what you just built:\n\`\`\`diff\n${currentDiff.substring(0, 4000)}\n\`\`\`\n` 
     : '';
@@ -60,6 +59,7 @@ TOOL USAGE CONTRACT
 4) Use 'run_command' ONLY to execute system/dependency commands (e.g., "cd app-folder && npm install package-name" or "npx tsc"). 
 5) CRITICAL RULE: DO NOT use 'run_command' to create or modify code files (no 'touch', 'echo', or 'cat'). All file creations and modifications MUST be done via the FINAL OUTPUT JSON.
 6) Before calling a tool, you MUST write a brief 1-2 sentence explanation of your thought process in the message content.
+7) 🧠 CONTEXT EXPANSION: I have provided your recent uncommitted changes in the prompt below. However, you can STILL use 'run_command' with 'git status', 'git diff <file>', or 'git log' if you need to investigate other parts of the repository history.
 
 FINAL OUTPUT CONTRACT (STRICT)
 - Return exactly ONE valid JSON object.
@@ -130,7 +130,7 @@ export async function generateAndWriteCode(
   figmaData: string | null,
   projectTree: string,
   projectMemory: string | null,
-  currentDiff: string | null, // 👈 Lo volvemos a recibir
+  currentDiff: string | null,
   onStatusUpdate?: (status: string, thought?: string) => void
 ): Promise<{ targetRoute: string; commitMessage: string; tokenUsage: number }> {
   
@@ -255,7 +255,6 @@ export async function generateAndWriteCode(
   return { targetRoute: finalResult.targetRoute || '/', commitMessage: finalResult.commitMessage || 'feat: auto-update', tokenUsage: totalTokens };
 }
 
-// Generador de PRs Inteligentes
 export async function generatePRMetadata(diff: string): Promise<string> {
   const openai = new OpenAI({ baseURL: 'https://api.deepseek.com', apiKey: process.env.DEEPSEEK_API_KEY as string });
   

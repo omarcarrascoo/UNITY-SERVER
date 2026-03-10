@@ -16,10 +16,36 @@ const execPromise = util.promisify(exec);
 const client = new Client({ intents: [ GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent ]});
 const sessionStore = new Map<string, string>();
 
+// 🚦 SEMÁFORO GLOBAL: Evita que dos peticiones corran al mismo tiempo
+let isProcessing = false; 
+
 client.on('messageCreate', async (message: Message) => {
     if (message.author.bot || (message.channel as any).name !== 'jarvis-dev') return;
 
+    // 🛡️ SEGURO 1: Bloqueo de Concurrencia (Semáforo)
+    if (isProcessing) {
+        const warningMsg = await message.reply('⏳ **¡Paciencia!** Jarvis está procesando otra solicitud en este momento. Espera a que termine.');
+        setTimeout(() => warningMsg.delete().catch(() => {}), 5000); // Borra el aviso en 5 seg
+        return;
+    }
+
     const isIteration = !!message.reference;
+
+    // 🛡️ SEGURO 2: Anti-Borrado de código sin guardar
+    if (!isIteration) {
+        try {
+            const { stdout: gitStatus } = await execPromise(`git status --porcelain`, { cwd: TARGET_REPO_PATH });
+            if (gitStatus.trim() !== '') {
+                await message.reply('⚠️ **¡Seguro Activado!** Tienes trabajo en progreso sin guardar.\n\n👉 Para iterar sobre el código actual, debes darle a **"Responder"** (Reply) al mensaje anterior.\n👉 Si realmente quieres empezar una tarea nueva, presiona el botón rojo `🗑️ Revert` del mensaje anterior para limpiar el entorno.');
+                return; // Bloqueamos la ejecución para salvar el código
+            }
+        } catch (error) {
+            console.warn("No se pudo verificar el estado de git para el seguro:", error);
+        }
+    }
+
+    // 🔴 CERRAMOS LA PUERTA: Jarvis empieza a trabajar
+    isProcessing = true;
 
     const replyMessage = await message.reply(
         isIteration 
@@ -51,7 +77,6 @@ client.on('messageCreate', async (message: Message) => {
             await thread.send('🧠 UnityRC memory loaded. Applying architectural rules...');
         }
 
-        // 🧠 DE VUELTA: Capturar el diff actual si es iteración
         let currentDiff = null;
         if (isIteration) {
             const { stdout } = await execPromise(`git diff`, { cwd: TARGET_REPO_PATH }).catch(() => ({ stdout: '' }));
@@ -66,7 +91,7 @@ client.on('messageCreate', async (message: Message) => {
             : message.content;
 
         const { targetRoute, commitMessage, tokenUsage } = await generateAndWriteCode(
-            finalPrompt, figmaData, projectTree, projectMemory, currentDiff, // 👈 Pasamos el currentDiff
+            finalPrompt, figmaData, projectTree, projectMemory, currentDiff,
             async (statusMsg, thought) => {
                 let logMessage = `**${statusMsg}**`;
                 if (thought && thought !== "") {
@@ -82,6 +107,17 @@ client.on('messageCreate', async (message: Message) => {
         await thread.send(`📸 Code generated. Navigating to \`${targetRoute}\` to take snapshot...`);
         
         const { snapshotPath, publicUrl, localUrl, warning } = await takeSnapshot(targetRoute);
+
+        // Limpieza y archivado de archivos diff viejos
+        const logsDir = path.join(WORKSPACE_DIR, 'logs');
+        if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+
+        const workspaceFiles = fs.readdirSync(WORKSPACE_DIR);
+        for (const file of workspaceFiles) {
+            if (file.endsWith('.diff') && fs.statSync(path.join(WORKSPACE_DIR, file)).isFile()) {
+                fs.renameSync(path.join(WORKSPACE_DIR, file), path.join(logsDir, file));
+            }
+        }
 
         const { stdout: diffOutput } = await execPromise(`git diff`, { cwd: TARGET_REPO_PATH }).catch(() => ({ stdout: '' }));
         let diffPath = null;
@@ -116,6 +152,9 @@ client.on('messageCreate', async (message: Message) => {
         
         await thread.send(`❌ **CRITICAL ERROR:**\n\`\`\`bash\n${safeError}\n\`\`\``);
         await replyMessage.edit(`❌ Error encountered. Please check the thread logs for details.`);
+    } finally {
+        // 🟢 ABRIMOS LA PUERTA: Jarvis terminó (ya sea con éxito o con error)
+        isProcessing = false;
     }
 });
 
@@ -123,6 +162,14 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     
     if (interaction.isButton()) {
         const [action, sessionId] = interaction.customId.split('_');
+
+        // Si se presiona un botón, también bloqueamos peticiones simultáneas por seguridad
+        if (isProcessing) {
+            await interaction.reply({ content: '⏳ Jarvis está ocupado en otra tarea. Espera a que termine.', ephemeral: true });
+            return;
+        }
+
+        isProcessing = true;
 
         if (action === 'approve') {
             await interaction.update({ content: '🚀 Analyzing all session changes to generate a Smart PR...', components: [], files: [] });
@@ -139,17 +186,23 @@ client.on('interactionCreate', async (interaction: Interaction) => {
             } catch (error) {
                 console.error(error);
                 await interaction.followUp(`❌ Failed to create PR.`);
+            } finally {
+                isProcessing = false;
             }
         } else if (action === 'reject') {
-            await execPromise(`git reset --hard HEAD`, { cwd: TARGET_REPO_PATH }).catch(() => {});
-            await execPromise(`git clean -fd`, { cwd: TARGET_REPO_PATH }).catch(() => {});
-            
-            await interaction.update({ 
-                content: '🗑️ **Cambios revertidos.** El repositorio ha vuelto a su estado original limpio.', 
-                components: [], 
-                files: [] 
-            });
-            sessionStore.delete(sessionId);
+            try {
+                await execPromise(`git reset --hard HEAD`, { cwd: TARGET_REPO_PATH }).catch(() => {});
+                await execPromise(`git clean -fd`, { cwd: TARGET_REPO_PATH }).catch(() => {});
+                
+                await interaction.update({ 
+                    content: '🗑️ **Cambios revertidos.** El repositorio ha vuelto a su estado original limpio.', 
+                    components: [], 
+                    files: [] 
+                });
+                sessionStore.delete(sessionId);
+            } finally {
+                isProcessing = false;
+            }
         }
         return;
     }
@@ -158,7 +211,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         const { commandName } = interaction;
 
         if (commandName === 'status') {
-            await interaction.reply(`🤖 **Estado Actual:**\nJarvis está enfocado en el repositorio: \`${process.env.GITHUB_REPO}\``);
+            await interaction.reply(`🤖 **Estado Actual:**\nJarvis está enfocado en el repositorio: \`${process.env.GITHUB_REPO}\`\nProcesando tarea: ${isProcessing ? 'Sí 🔴' : 'No 🟢'}`);
         }
 
         if (commandName === 'workon') {
