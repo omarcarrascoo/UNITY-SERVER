@@ -43,7 +43,8 @@ Capabilities:
 
 # 🏗 System Architecture
 
-```
+```mermaid
+flowchart LR
     U[Discord user in #jarvis-dev] --> D[index.ts]
     D --> W[prepareWorkspace() src/git.ts]
     D --> S[getProjectTree + getProjectMemory src/scanner.ts]
