@@ -198,8 +198,7 @@ These control the active workspace.
 
 ```mermaid
 flowchart TD
-    P[User Prompt] 
-    P[User Prompt] --> R[Agent Reasoning]
+    P[User Prompt] --> F[Figma MCP nodes] --> R[Agent Reasoning]
     R --> T[Tool Call]
     T --> C[Tool Result]
     C --> R
