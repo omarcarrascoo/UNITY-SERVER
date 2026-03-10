@@ -1,22 +1,21 @@
 import fs from 'fs';
 import path from 'path';
 
-// 🌳 Se agregaron currentDepth y maxDepth (por defecto 2 niveles) para ahorrar tokens
+// Keep the tree shallow to reduce prompt size sent to the model.
 export function getProjectTree(dirPath: string, prefix: string = '', currentDepth: number = 0, maxDepth: number = 2): string {
     let tree = '';
     if (!fs.existsSync(dirPath)) return tree;
 
-    // 🛑 Límite de profundidad alcanzado
     if (currentDepth > maxDepth) {
         return `${prefix}└── ... (más archivos. Usa 'ls' o 'search_project' para explorar aquí)\n`;
     }
 
     const items = fs.readdirSync(dirPath);
     
-    // Filtros súper optimizados para ahorrar tokens en el LLM
     const ignoreDirs = ['node_modules', '.git', 'assets', 'dist', '.expo', 'workspaces', 'ios', 'android', 'web-build', 'scripts', '.github', 'components/__tests__'];
     const ignoreFiles = ['package-lock.json', 'yarn.lock', 'bun.lockb', 'babel.config.js', 'metro.config.js', 'app.json', 'eas.json', '.gitignore', '.env', '.env.example'];
 
+    // Sort directories first to produce a predictable, human-readable tree.
     items.sort((a, b) => {
         const aIsDir = fs.statSync(path.join(dirPath, a)).isDirectory();
         const bIsDir = fs.statSync(path.join(dirPath, b)).isDirectory();
@@ -34,7 +33,6 @@ export function getProjectTree(dirPath: string, prefix: string = '', currentDept
         if (stat.isDirectory()) {
             if (!ignoreDirs.includes(item)) {
                 tree += `${prefix}${isLast ? '└── ' : '├── '}${item}/\n`;
-                // Incrementamos la profundidad en la llamada recursiva
                 tree += getProjectTree(fullPath, prefix + (isLast ? '    ' : '│   '), currentDepth + 1, maxDepth);
             }
         } else {
@@ -46,7 +44,7 @@ export function getProjectTree(dirPath: string, prefix: string = '', currentDept
     return tree;
 }
 
-// 🧠 Lector de Memoria UnityRC (con búsqueda de archivos ocultos)
+// Accept both hidden and non-hidden UnityRC variants.
 export function getProjectMemory(repoPath: string): string | null {
     const possibleNames = [
         '.unityrc.md', 

@@ -5,12 +5,14 @@ import util from 'util';
 import { TARGET_REPO_PATH } from './config.js';
 
 const execPromise = util.promisify(exec);
+// Tool functions operate relative to the currently selected repository root.
 const REPO_ROOT = path.resolve(TARGET_REPO_PATH);
 const IGNORE_DIRS = new Set([
   '.git', 'node_modules', 'dist', 'build', 'coverage', '.expo', 'ios', 'android', '.next',
 ]);
 const SOURCE_FILE_REGEX = /\.(ts|tsx|js|jsx|json|md)$/i;
 
+// Prevents path traversal when the model requests file reads.
 function resolveSafePath(relativePath: string): string {
   if (typeof relativePath !== 'string' || !relativePath.trim()) {
     throw new Error('Invalid path: expected non-empty relative path string.');
@@ -22,6 +24,7 @@ function resolveSafePath(relativePath: string): string {
   return fullPath;
 }
 
+// Returns a numbered line window so model edits can target exact ranges.
 function lineSlice(content: string, startLine = 1, endLine = 300): string {
   const lines = content.split('\n');
   const safeStart = Math.max(1, Math.floor(startLine));
@@ -37,6 +40,7 @@ function lineSlice(content: string, startLine = 1, endLine = 300): string {
     .join('\n');
 }
 
+// Exposed tool: bounded file reader with stable "FILE/LINES" envelope format.
 export function readFile(filepath: string, startLine = 1, endLine = 300): string {
   try {
     const fullPath = resolveSafePath(filepath);
@@ -53,6 +57,7 @@ export function readFile(filepath: string, startLine = 1, endLine = 300): string
 
 interface SearchHit { file: string; lines: Array<{ line: number; text: string }>; }
 
+// DFS over source files with an early stop to control token and runtime cost.
 function collectSearchHits(keyword: string, maxResults: number, dir = REPO_ROOT, hits: SearchHit[] = []): SearchHit[] {
   if (hits.length >= maxResults) return hits;
   const entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -80,11 +85,14 @@ function collectSearchHits(keyword: string, maxResults: number, dir = REPO_ROOT,
         }
       }
       hits.push({ file: path.relative(REPO_ROOT, fullPath), lines: matches });
-    } catch { /* Skip unreadable files */ }
+    } catch {
+      // Ignore files that cannot be read due to permissions or encoding issues.
+    }
   }
   return hits;
 }
 
+// Exposed tool: case-insensitive keyword search with compact per-file snippets.
 export function searchProject(keyword: string, maxResults = 30): string {
   try {
     if (typeof keyword !== 'string' || !keyword.trim()) return 'Error: keyword must be a non-empty string.';
@@ -106,9 +114,11 @@ export function searchProject(keyword: string, maxResults = 30): string {
   }
 }
 
+// Exposed tool: command runner with path guards and explicit command allowlist.
 export async function runCommand(cmd: string): Promise<string> {
     const trimmedCmd = cmd.trim();
 
+    // Reject absolute paths and parent traversal outside expected workspace usage.
     const blockedPatterns = [/\.\.\//, /(^|\s)\/(?!dev|tmp)/, /~/];
     for (const pattern of blockedPatterns) {
         if (pattern.test(trimmedCmd)) {
@@ -124,6 +134,7 @@ export async function runCommand(cmd: string): Promise<string> {
         "git status", "git diff", "git log"
     ];
 
+    // Validate chained commands independently so each segment is explicitly allowed.
     const subCommands = trimmedCmd.split('&&').map(s => s.trim());
     
     for (const subCmd of subCommands) {
@@ -146,6 +157,7 @@ export async function runCommand(cmd: string): Promise<string> {
     }
 }
 
+// JSON schemas exposed to the LLM as callable function tools.
 export const agentTools: any[] = [
   {
     type: 'function',

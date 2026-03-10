@@ -14,44 +14,53 @@ import { generateAndWriteCode, generatePRMetadata } from './src/ai.js';
 
 const execPromise = util.promisify(exec);
 const client = new Client({ intents: [ GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent ]});
+// Stores generated commit messages by session id so button actions can resolve context.
 const sessionStore = new Map<string, string>();
 
-// 🚦 SEMÁFORO GLOBAL: Evita que dos peticiones corran al mismo tiempo
+// Global single-flight guard for the coding pipeline.
 let isProcessing = false; 
+// Active cancellation signal for the current request lifecycle.
+let currentAbortController: AbortController | null = null;
 
 client.on('messageCreate', async (message: Message) => {
+    // Ignore bot messages and all channels except the dedicated development channel.
     if (message.author.bot || (message.channel as any).name !== 'jarvis-dev') return;
 
-    // 🛡️ SEGURO 1: Bloqueo de Concurrencia (Semáforo)
+    // Prevent concurrent workspace mutations across independent Discord messages.
     if (isProcessing) {
-        const warningMsg = await message.reply('⏳ **¡Paciencia!** Jarvis está procesando otra solicitud en este momento. Espera a que termine.');
-        setTimeout(() => warningMsg.delete().catch(() => {}), 5000); // Borra el aviso en 5 seg
+        const warningMsg = await message.reply('⏳ **¡Paciencia!** Jarvis está procesando otra solicitud en este momento. Espera a que termine o cancélala.');
+        setTimeout(() => warningMsg.delete().catch(() => {}), 5000); 
         return;
     }
 
+    // A Discord "reply" indicates an iteration over the previous run's uncommitted state.
     const isIteration = !!message.reference;
 
-    // 🛡️ SEGURO 2: Anti-Borrado de código sin guardar
     if (!isIteration) {
         try {
+            // New tasks require a clean tree; otherwise users should iterate or explicitly revert.
             const { stdout: gitStatus } = await execPromise(`git status --porcelain`, { cwd: TARGET_REPO_PATH });
             if (gitStatus.trim() !== '') {
                 await message.reply('⚠️ **¡Seguro Activado!** Tienes trabajo en progreso sin guardar.\n\n👉 Para iterar sobre el código actual, debes darle a **"Responder"** (Reply) al mensaje anterior.\n👉 Si realmente quieres empezar una tarea nueva, presiona el botón rojo `🗑️ Revert` del mensaje anterior para limpiar el entorno.');
-                return; // Bloqueamos la ejecución para salvar el código
+                return; 
             }
         } catch (error) {
             console.warn("No se pudo verificar el estado de git para el seguro:", error);
         }
     }
 
-    // 🔴 CERRAMOS LA PUERTA: Jarvis empieza a trabajar
     isProcessing = true;
+    currentAbortController = new AbortController();
 
-    const replyMessage = await message.reply(
-        isIteration 
-        ? '🤖 Acknowledged. Agent waking up for iteration...' 
-        : '🤖 Acknowledged. Preparing a fresh workspace...'
+    // Immediate control surface so users can cancel long AI/tool executions.
+    const cancelRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId(`cancel_task`).setLabel('🛑 Cancelar Tarea').setStyle(ButtonStyle.Secondary)
     );
+
+    const replyMessage = await message.reply({
+        content: isIteration ? '🤖 Acknowledged. Agent waking up for iteration...' : '🤖 Acknowledged. Preparing a fresh workspace...',
+        components: [cancelRow]
+    });
 
     const threadName = message.content.length > 20 
         ? `🧠 Jarvis Logs - ${message.content.substring(0, 20)}...` 
@@ -63,13 +72,16 @@ client.on('messageCreate', async (message: Message) => {
     });
 
     try {
+        // Iterations keep the current workspace state; fresh requests reset and re-install as needed.
         if (!isIteration) {
             await prepareWorkspace();
         }
         
+        // Pull external design context only when a Figma URL is present.
         const figmaData = await getFigmaContext(message.content);
         if (figmaData) await thread.send('🎨 Figma link detected. Analyzing design...');
         
+        // Build lightweight repository context for the model prompt.
         const projectTree = getProjectTree(TARGET_REPO_PATH);
         const projectMemory = getProjectMemory(TARGET_REPO_PATH);
         
@@ -79,6 +91,7 @@ client.on('messageCreate', async (message: Message) => {
 
         let currentDiff = null;
         if (isIteration) {
+            // Feed recent local changes back to the model to avoid accidental regressions.
             const { stdout } = await execPromise(`git diff`, { cwd: TARGET_REPO_PATH }).catch(() => ({ stdout: '' }));
             if (stdout.trim()) {
                 currentDiff = stdout;
@@ -93,12 +106,14 @@ client.on('messageCreate', async (message: Message) => {
         const { targetRoute, commitMessage, tokenUsage } = await generateAndWriteCode(
             finalPrompt, figmaData, projectTree, projectMemory, currentDiff,
             async (statusMsg, thought) => {
+                // Stream model/tool progress into the thread for observability.
                 let logMessage = `**${statusMsg}**`;
                 if (thought && thought !== "") {
                     logMessage += `\n> 💭 *${thought.replace(/\n/g, '\n> ')}*`;
                 }
                 await thread.send(logMessage).catch(() => {});
-            }
+            },
+            currentAbortController.signal
         );
         
         const sessionId = Date.now().toString().slice(-6);
@@ -108,7 +123,7 @@ client.on('messageCreate', async (message: Message) => {
         
         const { snapshotPath, publicUrl, localUrl, warning } = await takeSnapshot(targetRoute);
 
-        // Limpieza y archivado de archivos diff viejos
+        // Archive historical diff artifacts in /workspaces/logs before saving the new session diff.
         const logsDir = path.join(WORKSPACE_DIR, 'logs');
         if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
 
@@ -126,6 +141,7 @@ client.on('messageCreate', async (message: Message) => {
             fs.writeFileSync(diffPath, diffOutput);
         }
 
+        // Approval controls are session-scoped so follow-up actions target the right generated changes.
         const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
             new ButtonBuilder().setCustomId(`approve_${sessionId}`).setLabel('✅ Approve & PR').setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId(`reject_${sessionId}`).setLabel('🗑️ Revert (Start Over)').setStyle(ButtonStyle.Danger),
@@ -147,14 +163,25 @@ client.on('messageCreate', async (message: Message) => {
         await thread.setArchived(true);
 
     } catch (error: any) {
-        console.error(error);
-        const safeError = error.message.length > 1500 ? error.message.substring(0, 1500) + '...' : error.message;
-        
-        await thread.send(`❌ **CRITICAL ERROR:**\n\`\`\`bash\n${safeError}\n\`\`\``);
-        await replyMessage.edit(`❌ Error encountered. Please check the thread logs for details.`);
+        if (error.message === 'AbortError' || error.name === 'AbortError') {
+            console.log("🛑 Tarea abortada por el usuario.");
+
+            // Ensure partial edits are discarded when a run is canceled mid-write.
+            await execPromise(`git reset --hard HEAD`, { cwd: TARGET_REPO_PATH }).catch(() => {});
+            await execPromise(`git clean -fd`, { cwd: TARGET_REPO_PATH }).catch(() => {});
+            
+            await thread.send(`🛑 **Misión Abortada:** El usuario canceló la tarea. El repositorio ha sido restaurado.`);
+            await replyMessage.edit({ content: `🛑 **Tarea Cancelada.** El entorno está limpio y listo para otra solicitud.`, components: [] });
+            await thread.setArchived(true);
+        } else {
+            console.error(error);
+            const safeError = error.message.length > 1500 ? error.message.substring(0, 1500) + '...' : error.message;
+            await thread.send(`❌ **CRITICAL ERROR:**\n\`\`\`bash\n${safeError}\n\`\`\``);
+            await replyMessage.edit({ content: `❌ Error encountered. Please check the thread logs for details.`, components: [] });
+        }
     } finally {
-        // 🟢 ABRIMOS LA PUERTA: Jarvis terminó (ya sea con éxito o con error)
         isProcessing = false;
+        currentAbortController = null;
     }
 });
 
@@ -163,7 +190,17 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     if (interaction.isButton()) {
         const [action, sessionId] = interaction.customId.split('_');
 
-        // Si se presiona un botón, también bloqueamos peticiones simultáneas por seguridad
+        // Cancellation bypasses the global busy gate so users can always stop an in-flight run.
+        if (action === 'cancel' && sessionId === 'task') {
+            if (currentAbortController) {
+                currentAbortController.abort();
+                await interaction.update({ content: '🛑 Interceptando a Jarvis... abortando procesos.', components: [] });
+            } else {
+                await interaction.update({ content: '⚠️ No hay ninguna tarea corriendo.', components: [] });
+            }
+            return;
+        }
+
         if (isProcessing) {
             await interaction.reply({ content: '⏳ Jarvis está ocupado en otra tarea. Espera a que termine.', ephemeral: true });
             return;
@@ -172,6 +209,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         isProcessing = true;
 
         if (action === 'approve') {
+            // Build PR metadata from the final in-memory diff when available.
             await interaction.update({ content: '🚀 Analyzing all session changes to generate a Smart PR...', components: [], files: [] });
             try {
                 const { stdout: finalDiff } = await execPromise(`git diff`, { cwd: TARGET_REPO_PATH }).catch(() => ({ stdout: '' }));
@@ -191,6 +229,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
             }
         } else if (action === 'reject') {
             try {
+                // Hard cleanup restores a deterministic baseline for the next request.
                 await execPromise(`git reset --hard HEAD`, { cwd: TARGET_REPO_PATH }).catch(() => {});
                 await execPromise(`git clean -fd`, { cwd: TARGET_REPO_PATH }).catch(() => {});
                 
@@ -215,6 +254,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         }
 
         if (commandName === 'workon') {
+            // Dynamically retargets the active repository under /workspaces.
             const repoName = interaction.options.getString('repo', true);
             setActiveProject(repoName);
             
@@ -229,6 +269,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         }
 
         if (commandName === 'init') {
+            // Scaffolds a starter project in /workspaces for quick bootstrapping.
             const type = interaction.options.getString('type', true);
             const name = interaction.options.getString('name', true);
             

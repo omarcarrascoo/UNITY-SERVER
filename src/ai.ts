@@ -11,6 +11,7 @@ const execPromise = util.promisify(exec);
 export interface FileEdit { filepath: string; search: string; replace: string; }
 export interface AIResponse { targetRoute: string; commitMessage: string; edits: FileEdit[]; }
 
+// Stable repository heuristics injected into the system prompt for architectural consistency.
 const REPO_PATTERNS = `
 REPOSITORY OVERVIEW
 - Monorepos structure: frontends (expo) and backends (nest/api).
@@ -29,6 +30,7 @@ DELIVERY RULES
 - Use "search" and "replace" blocks to patch files. The "search" string MUST perfectly match existing code.
 `;
 
+// Assembles static policies with dynamic context (tree, memory, figma, and current diff).
 function buildSystemPrompt(userPrompt: string, figmaData: string | null, projectTree: string, projectMemory: string | null, currentDiff: string | null): string {
   const figmaInstructions = figmaData ? `FIGMA JSON CONTEXT:\n${figmaData}` : 'FIGMA JSON CONTEXT: (none)';
   
@@ -76,9 +78,10 @@ FINAL OUTPUT CONTRACT (STRICT)
   ]
 }
 - If creating a NEW file, leave "search" empty.
-`;
+  `;
 }
 
+// Extracts the first valid JSON object from model text that may include markdown wrappers.
 function extractJsonObject(raw: string): string {
   let text = (raw || '').trim().replace(/```json/gi, '').replace(/```/g, '').trim();
   text = text.replace(/[\u00A0\u2028\u2029\u200B]/g, ' ');
@@ -91,6 +94,7 @@ function extractJsonObject(raw: string): string {
   throw new Error('No JSON object found.');
 }
 
+// Guards file writes so generated edits cannot escape the active repository root.
 function resolveSafeFilePath(relativeFilePath: string): string {
   const repoRoot = path.resolve(TARGET_REPO_PATH);
   const fullPath = path.resolve(repoRoot, relativeFilePath);
@@ -100,6 +104,7 @@ function resolveSafeFilePath(relativeFilePath: string): string {
   return fullPath;
 }
 
+// Applies search/replace patches; "search" empty means create or overwrite file content.
 function applyEditsToFiles(edits: FileEdit[]): string[] {
     const patchErrors: string[] = [];
     
@@ -125,13 +130,15 @@ function applyEditsToFiles(edits: FileEdit[]): string[] {
     return patchErrors;
 }
 
+// Main generation loop: tool calls + patching + compile validation + self-correction retries.
 export async function generateAndWriteCode(
   userPrompt: string,
   figmaData: string | null,
   projectTree: string,
   projectMemory: string | null,
   currentDiff: string | null,
-  onStatusUpdate?: (status: string, thought?: string) => void
+  onStatusUpdate?: (status: string, thought?: string) => void,
+  signal?: AbortSignal
 ): Promise<{ targetRoute: string; commitMessage: string; tokenUsage: number }> {
   
   const openai = new OpenAI({ baseURL: 'https://api.deepseek.com', apiKey: process.env.DEEPSEEK_API_KEY as string });
@@ -146,6 +153,9 @@ export async function generateAndWriteCode(
   let totalTokens = 0; 
 
   for (let loop = 1; loop <= MAX_LOOPS; loop++) {
+    // Stop before each iteration so cancellation does not trigger extra work.
+    if (signal?.aborted) throw new Error('AbortError');
+
     const statusMsg = `🔄 Iteration ${loop}... Thinking...`;
     console.log(statusMsg);
     if (onStatusUpdate) onStatusUpdate(statusMsg);
@@ -156,7 +166,7 @@ export async function generateAndWriteCode(
       tools: agentTools,
       temperature: 0.1,
       max_tokens: 8192,
-    });
+    }, { signal });
 
     if (response.usage) {
       totalTokens += response.usage.total_tokens;
@@ -170,6 +180,7 @@ export async function generateAndWriteCode(
     const agentThought = message.content ? message.content.trim() : "";
 
     if (message.tool_calls?.length) {
+      // Execute tool calls and append outputs as tool-role messages for the next model turn.
       for (const toolCall of message.tool_calls) {
         const functionName = toolCall.function.name;
         let toolResult = '';
@@ -216,6 +227,7 @@ export async function generateAndWriteCode(
       }
 
       let compilationErrors = '';
+      // Compile only touched top-level folders to keep validation time bounded on monorepos.
       const dirsToCheck = new Set((finalResult.edits || []).map(e => {
           const parts = e.filepath.split('/');
           return parts.length > 1 ? parts[0] : '.'; 
@@ -255,6 +267,7 @@ export async function generateAndWriteCode(
   return { targetRoute: finalResult.targetRoute || '/', commitMessage: finalResult.commitMessage || 'feat: auto-update', tokenUsage: totalTokens };
 }
 
+// Summarizes the accumulated diff into a conventional commit for PR title/body usage.
 export async function generatePRMetadata(diff: string): Promise<string> {
   const openai = new OpenAI({ baseURL: 'https://api.deepseek.com', apiKey: process.env.DEEPSEEK_API_KEY as string });
   

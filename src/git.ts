@@ -6,9 +6,11 @@ import { WORKSPACE_DIR, TARGET_REPO_PATH } from './config.js';
 
 const execPromise = util.promisify(exec);
 
+// Runtime-discovered app and API roots used by snapshot and orchestration modules.
 export let TARGET_EXPO_PATH = TARGET_REPO_PATH;
-export let TARGET_API_PATH: string | null = null; // 🧠 NUEVO: Memoria para la ubicación del backend
+export let TARGET_API_PATH: string | null = null;
 
+// Ensures the active repo exists locally and is reset to a known clean baseline.
 export async function prepareWorkspace(): Promise<void> {
     if (!fs.existsSync(WORKSPACE_DIR)) fs.mkdirSync(WORKSPACE_DIR);
 
@@ -28,6 +30,7 @@ export async function prepareWorkspace(): Promise<void> {
     await autoDetectAndInstall(TARGET_REPO_PATH);
 }
 
+// Detects project topology (single Expo app vs monorepo) and installs dependencies.
 async function autoDetectAndInstall(basePath: string) {
     console.log(`📦 Scanning architecture in ${basePath}...`);
     let isSingleRepo = false;
@@ -54,13 +57,12 @@ async function autoDetectAndInstall(basePath: string) {
 
                     const pkg = JSON.parse(fs.readFileSync(path.join(subDir, 'package.json'), 'utf8'));
                     
-                    // Detectar Frontend (Expo)
                     if (pkg.dependencies?.expo || pkg.devDependencies?.expo || item.name.startsWith('expo-')) {
                         console.log(`🚀 Expo App located at: ${subDir}`);
                         TARGET_EXPO_PATH = subDir;
                     }
                     
-                    // 🧠 Detectar Backend (NestJS)
+                    // Detect backend modules with framework deps and common naming conventions.
                     if (pkg.dependencies?.['@nestjs/core'] || item.name.includes('api') || item.name.includes('infra')) {
                         console.log(`🔌 NestJS API located at: ${subDir}`);
                         TARGET_API_PATH = subDir;
@@ -71,6 +73,7 @@ async function autoDetectAndInstall(basePath: string) {
     }
 }
 
+// Creates a feature branch, commits generated changes, pushes, and opens a GitHub PR.
 export async function createPullRequest(featureName: string, commitMessage: string): Promise<string> {
     const branchName = `jarvis-${featureName}`;
     const safeCommitMsg = commitMessage.replace(/"/g, '\\"'); 

@@ -5,6 +5,7 @@ import util from 'util';
 
 const execPromise = util.promisify(exec);
 
+// Creates an Expo project preloaded with the project's preferred state, API, and styling stack.
 export async function initExpoProject(projectName: string, workspaceDir: string) {
     const projectPath = path.join(workspaceDir, projectName);
     console.log(`🚀 Iniciando creación de Expo App: ${projectName}...`);
@@ -18,6 +19,7 @@ export async function initExpoProject(projectName: string, workspaceDir: string)
     await execPromise(`npm install --save-dev tailwindcss@3.3.2`, { cwd: projectPath });
     await execPromise(`npx tailwindcss init`, { cwd: projectPath });
     
+    // Write deterministic baseline config so generated code can assume NativeWind + Oswald setup.
     const tailwindConfig = `/** @type {import('tailwindcss').Config} */\nmodule.exports = { content: ["./app/**/*.{js,jsx,ts,tsx}", "./components/**/*.{js,jsx,ts,tsx}"], theme: { extend: { fontFamily: { oswald: ['Oswald_400Regular'] } } }, plugins: [] }`;
     fs.writeFileSync(path.join(projectPath, 'tailwind.config.js'), tailwindConfig);
 
@@ -30,13 +32,13 @@ export async function initExpoProject(projectName: string, workspaceDir: string)
     fs.writeFileSync(path.join(projectPath, 'store/authStore.ts'), `import { create } from 'zustand';\nexport const useAuthStore = create((set) => ({ user: null, token: null, setAuth: (data) => set(data), logout: () => set({ user: null, token: null }) }));`);
     fs.writeFileSync(path.join(projectPath, 'api/axios.ts'), `import axios from 'axios';\nconst api = axios.create({ baseURL: process.env.EXPO_PUBLIC_API_URL || 'http://localhost:3000' });\napi.interceptors.request.use(config => { config.headers['ngrok-skip-browser-warning'] = 'true'; return config; });\nexport default api;`);
 
-    // 🧠 Inyectar Memoria a Largo Plazo
     const unityMemory = `# Reglas de Arquitectura - Frontend (Expo)\n1. **Estilos:** Usa SIEMPRE las constantes de \`theme/index.ts\`.\n2. **Estado Global:** Usa Zustand.\n3. **Peticiones HTTP:** Usa SIEMPRE \`api/axios.ts\`.\n4. **TypeScript:** Prohibido el uso de \`any\`.`;
     fs.writeFileSync(path.join(projectPath, '.unityrc.md'), unityMemory);
 
     console.log(`✅ ¡Plantilla de Expo lista!`);
 }
 
+// Creates a NestJS API starter with auth-ready dependencies and Swagger bootstrap.
 export async function initNestProject(projectName: string, workspaceDir: string) {
     const projectPath = path.join(workspaceDir, projectName);
     console.log(`🚀 Iniciando creación de NestJS API: ${projectName}...`);
@@ -58,13 +60,13 @@ export async function initNestProject(projectName: string, workspaceDir: string)
     );
     fs.writeFileSync(mainTsPath, mainTs);
 
-    // 🧠 Inyectar Memoria a Largo Plazo
     const unityMemory = `# Reglas de Arquitectura - Backend (NestJS)\n1. **Base de Datos:** Mongoose estricto.\n2. **Validación:** DTOs con class-validator.\n3. **Seguridad:** Guards de JWT para rutas protegidas.`;
     fs.writeFileSync(path.join(projectPath, '.unityrc.md'), unityMemory);
 
     console.log(`✅ ¡Plantilla de NestJS lista!`);
 }
 
+// Creates a monorepo container and scaffolds backend + mobile projects inside it.
 export async function initFullstackProject(projectName: string, workspaceDir: string) {
     const projectRoot = path.join(workspaceDir, projectName);
     console.log(`🚀 Creando Monorepo Fullstack: ${projectName}...`);

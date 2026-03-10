@@ -8,6 +8,7 @@ import { TARGET_REPO_PATH } from './config.js';
 export interface GeneratedFile { filepath: string; code: string; }
 export interface AIResponse { targetRoute: string; commitMessage: string; files: GeneratedFile[]; }
 
+// Legacy one-shot generator that requests full-file outputs instead of search/replace patches.
 export async function generateAndWriteCode(
     userPrompt: string, 
     figmaData: string | null, 
@@ -62,6 +63,7 @@ export async function generateAndWriteCode(
         if (msg.content[0].type === 'text') rawText = msg.content[0].text;
 
     } else {
+        // OpenAI-compatible providers share a common request shape via baseURL + modelName.
         let baseURL = '', apiKey = '', modelName = '';
         if (provider === 'deepseek') { baseURL = 'https://api.deepseek.com'; apiKey = process.env.DEEPSEEK_API_KEY as string; modelName = 'deepseek-chat'; } 
         else if (provider === 'groq') { baseURL = 'https://api.groq.com/openai/v1'; apiKey = process.env.GROQ_API_KEY as string; modelName = 'llama-3.3-70b-versatile'; } 
@@ -78,17 +80,15 @@ export async function generateAndWriteCode(
         rawText = completion.choices[0].message?.content || '{}';
     }
 
-    // 1. Limpieza básica de Markdown
+    // Normalize model output before parsing: remove markdown fences, isolate JSON, strip invisible chars.
     rawText = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
 
-    // ✂️ 2. Extractor agresivo de JSON para domar a DeepSeek/Llama
     const firstBrace = rawText.indexOf('{');
     const lastBrace = rawText.lastIndexOf('}');
     if (firstBrace !== -1 && lastBrace !== -1 && lastBrace >= firstBrace) {
         rawText = rawText.substring(firstBrace, lastBrace + 1);
     }
 
-    // 🧹 3. NUEVO: Purificador de caracteres invisibles (Non-breaking spaces y saltos raros)
     rawText = rawText.replace(/[\u00A0\u2028\u2029\u200B]/g, ' ');
 
     try {

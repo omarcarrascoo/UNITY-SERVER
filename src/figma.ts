@@ -1,7 +1,7 @@
-// 🧠 Caché local para evitar Error 429 de Rate Limit
+// Cache node payloads by node id to avoid repeated Figma API requests.
 const figmaCache = new Map<string, string>();
 
-// ✂️ Limpiador de JSON para ahorrar tokens
+// Reduces Figma payload size to the subset needed for UI reconstruction.
 function cleanFigmaNode(node: any): any {
     if (!node) return node;
     const cleanNode: any = { type: node.type, name: node.name };
@@ -35,6 +35,7 @@ function cleanFigmaNode(node: any): any {
     return cleanNode;
 }
 
+// Extracts Figma node context from a Discord message and returns token-efficient JSON.
 export async function getFigmaContext(messageText: string): Promise<string | null> {
     const figmaRegex = /https:\/\/([\w.-]+\.)?figma.com\/(file|design)\/([a-zA-Z0-9]{22,128})(?:\/.*)?\?node-id=([a-zA-Z0-9%-]+)/;
     const match = messageText.match(figmaRegex);
@@ -60,6 +61,7 @@ export async function getFigmaContext(messageText: string): Promise<string | nul
     const data = await res.json();
     if (!data.nodes || !data.nodes[nodeId]) throw new Error(`Node ${nodeId} not found.`);
 
+    // Keep JSON compact; prompt consumers do not need pretty formatting.
     const rawNodeData = data.nodes[nodeId].document;
     const cleanData = cleanFigmaNode(rawNodeData);
     const jsonString = JSON.stringify(cleanData, null, 0); 
