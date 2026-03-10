@@ -241,26 +241,66 @@ These control the active workspace.
 
 ```mermaid
 flowchart TD
-    P[User Prompt]
+    %% --- CONTEXT GATHERING PHASE ---
+    subgraph Context_Assembly [1. Context Assembly]
+        P[User Prompt via Discord]
+        
+        Iter{Is Iteration?}
+        Iter -->|Yes| STM[Inject Short-Term Memory<br/>Git Diff]
+        Iter -->|No| Clean[Prepare Fresh Workspace]
+        
+        STM --> Fig{Detect Figma Link?}
+        Clean --> Fig
+        
+        Fig -->|Yes| Fetch[Fetch & Compress Figma Nodes]
+        Fig -->|No| Scan
+        Fetch --> Scan[Scan Project Tree & load .unityrc.md]
+    end
 
-    P --> D{Detect Figma Link?}
+    Scan --> Arena
 
-    D -->|Yes| F[Figma MCP Fetch Nodes]
-    F --> CL[Filter / Clean Figma Nodes]
+    %% --- AUTONOMOUS EXECUTION PHASE ---
+    subgraph Agent_Arena [2. The Self-Healing Arena]
+        Arena((Start Loop)) --> LLM[DeepSeek Reasoning]
+        
+        LLM --> Action{Agent Decision}
+        
+        %% Tool Path
+        Action -->|Use Tool| TCall[Execute: read_file, search, run_command]
+        TCall --> TRes[Return Truncated Tool Result]
+        TRes --> LLM
+        
+        %% Edit Path
+        Action -->|Output JSON| Edits[Apply Surgical File Edits]
+        
+        Edits --> Patch{Exact Search Block Found?}
+        Patch -->|No| PErr[Inject Patch Error Feedback]
+        PErr --> LLM
+        
+        Patch -->|Yes| TS[Run TypeScript Compiler<br/>npx tsc --noEmit]
+        
+        TS --> TSCheck{Compilation Passed?}
+        TSCheck -->|No| TSErr[Inject Truncated TS Errors]
+        TSErr --> LLM
+    end
 
-    D -->|No| R
+    TSCheck -->|Yes| Delivery
 
-    CL --> R[Agent Reasoning]
-
-    R --> T[Tool Call]
-    T --> C[Tool Result]
-    C --> R
-
-    R --> E[Code Edits]
-    E --> V[TypeScript Validation]
-    V --> S[Snapshot]
-    S --> U[User Approval]
-    U --> PR[Pull Request]
+    %% --- DELIVERY & HUMAN IN THE LOOP ---
+    subgraph Delivery_Phase [3. Validation & Delivery]
+        Delivery[Take Expo/Puppeteer Snapshot]
+        Delivery --> UI[Send Discord Message with Preview & URLs]
+        
+        UI --> Human{Human Decision}
+        
+        Human -->|Reply in Thread| Iter
+        
+        Human -->|✅ Approve| SmartPR[Read Full Session Diff]
+        SmartPR --> PRMsg[Generate Smart PR Message]
+        PRMsg --> PR[Open Pull Request]
+        
+        Human -->|🛑 Cancel / 🗑️ Revert| Reset[git reset --hard & clean]
+    end
 ```
 
 The AI gathers context before making any change.
