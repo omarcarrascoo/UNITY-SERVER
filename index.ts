@@ -12,6 +12,14 @@ import { getFigmaContext } from './src/figma.js';
 import { takeSnapshot } from './src/snapshot.js';
 import { generateAndWriteCode, generatePRMetadata } from './src/ai.js';
 
+
+console.log('BOOT DEBUG', {
+  cwd: process.cwd(),
+  workspaceDir: WORKSPACE_DIR,
+  githubRepo: process.env.GITHUB_REPO,
+  targetRepoPath: TARGET_REPO_PATH,
+});
+
 const execPromise = util.promisify(exec);
 const client = new Client({ intents: [ GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent ]});
 // Stores generated commit messages by session id so button actions can resolve context.
@@ -266,6 +274,13 @@ client.on('interactionCreate', async (interaction: Interaction) => {
             } catch (error: any) {
                 await interaction.followUp(`⚠️ Error al preparar el workspace: ${error.message}`);
             }
+
+            console.log('WORKON DEBUG', {
+                cwd: process.cwd(),
+                workspaceDir: WORKSPACE_DIR,
+                githubRepo: process.env.GITHUB_REPO,
+                targetRepoPath: TARGET_REPO_PATH,
+            });
         }
 
         if (commandName === 'init') {

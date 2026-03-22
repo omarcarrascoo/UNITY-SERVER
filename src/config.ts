@@ -1,8 +1,17 @@
 import path from 'path';
 import 'dotenv/config';
 
-// Base workspace where Jarvis clones/creates all target repositories.
-export const WORKSPACE_DIR: string = path.resolve('./workspaces');
+import { fileURLToPath } from 'url';
+import 'dotenv/config';
+
+
+
+
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+export const WORKSPACE_DIR: string = path.resolve(__dirname, '../workspaces');
 // Mutable pointer to the currently active repository inside WORKSPACE_DIR.
 export let TARGET_REPO_PATH: string = path.join(WORKSPACE_DIR, process.env.GITHUB_REPO as string);
 
