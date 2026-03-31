@@ -5,12 +5,10 @@ import puppeteer from 'puppeteer';
 import os from 'os';
 import util from 'util';
 import { exec } from 'child_process';
-import { WORKSPACE_DIR } from './config.js';
-import { TARGET_EXPO_PATH, TARGET_API_PATH } from './git.js';
+import type { PreparedWorkspace } from './domain/runtime.js';
 
 const execPromise = util.promisify(exec);
 
-// Long-lived process handles allow restarts between runs without zombie servers.
 let currentExpoProcess: ChildProcess | null = null;
 let currentNestProcess: ChildProcess | null = null;
 
@@ -21,7 +19,6 @@ export interface SnapshotResult {
   warning?: string;
 }
 
-// Selects the first non-loopback IPv4 address for LAN/Proxy preview links.
 function getLocalIpAddress(): string | null {
   const interfaces = os.networkInterfaces();
 
@@ -36,9 +33,8 @@ function getLocalIpAddress(): string | null {
   return null;
 }
 
-// Injects the backend URL into Expo's environment so the mobile app knows where to point.
-function injectApiUrlToEnv(url: string) {
-  const envPath = path.join(TARGET_EXPO_PATH, '.env');
+function injectApiUrlToEnv(expoPath: string, url: string) {
+  const envPath = path.join(expoPath, '.env');
   let envContent = '';
 
   if (fs.existsSync(envPath)) {
@@ -72,14 +68,19 @@ async function killPort(port: number) {
   }
 }
 
-// Boots backend/frontend locally and captures a mobile viewport screenshot of the target route.
-export async function takeSnapshot(targetRoute: string = '/'): Promise<SnapshotResult> {
-  // Normalizes Expo Router file paths into a browser-safe route.
-  let safeRoute = targetRoute.replace(/^\/?app\//, '/').replace(/\/\([^)]+\)/g, '').replace(/\/index\/?$/i, '');
-  if (!safeRoute || safeRoute === '') safeRoute = '/';
+export async function takeSnapshot(
+  workspace: PreparedWorkspace,
+  targetRoute: string = '/',
+): Promise<SnapshotResult> {
+  let safeRoute = targetRoute
+    .replace(/^\/?app\//, '/')
+    .replace(/\/\([^)]+\)/g, '')
+    .replace(/\/index\/?$/i, '');
+
+  if (!safeRoute) safeRoute = '/';
   if (!safeRoute.startsWith('/')) safeRoute = '/' + safeRoute;
 
-  const snapshotPath = path.join(WORKSPACE_DIR, 'snapshot.png');
+  const snapshotPath = path.join(workspace.workspaceDir, 'snapshot.png');
   const port = 8081;
   const backendPort = 3000;
   const localUrl = `http://localhost:${port}${safeRoute}`;
@@ -88,30 +89,26 @@ export async function takeSnapshot(targetRoute: string = '/'): Promise<SnapshotR
 
   console.log(`📸 Requested route: ${targetRoute}`);
   console.log('🚀 Launching preview services', {
-    expoPath: TARGET_EXPO_PATH,
-    apiPath: TARGET_API_PATH,
+    expoPath: workspace.expoPath,
+    apiPath: workspace.apiPath,
     localUrl,
     mobileUrl,
   });
 
-  // Kill tracked processes first.
   killTrackedProcess(currentExpoProcess, 'expo');
   killTrackedProcess(currentNestProcess, 'nest');
   currentExpoProcess = null;
   currentNestProcess = null;
 
-  // Then aggressively clear ports in case shell children survived.
   await killPort(port);
   await killPort(backendPort);
+  await new Promise((resolve) => setTimeout(resolve, 1500));
 
-  // Small pause so the OS releases ports cleanly.
-  await new Promise((r) => setTimeout(r, 1500));
-
-  if (TARGET_API_PATH) {
+  if (workspace.apiPath) {
     console.log('🔌 Starting NestJS Backend (Local Port 3000)...');
 
     currentNestProcess = spawn('npm', ['run', 'start'], {
-      cwd: TARGET_API_PATH,
+      cwd: workspace.apiPath,
       stdio: 'pipe',
     });
 
@@ -124,27 +121,24 @@ export async function takeSnapshot(targetRoute: string = '/'): Promise<SnapshotR
     });
 
     const backendUrl = ip ? `http://${ip}:${backendPort}` : `http://localhost:${backendPort}`;
-    injectApiUrlToEnv(backendUrl);
-
-    await new Promise((r) => setTimeout(r, 3000));
+    injectApiUrlToEnv(workspace.expoPath, backendUrl);
+    await new Promise((resolve) => setTimeout(resolve, 3000));
   }
 
   return new Promise((resolve) => {
     console.log('🚀 Starting new Expo Web Server...');
 
     currentExpoProcess = spawn('npx', ['expo', 'start', '--web', '--port', port.toString()], {
-      cwd: TARGET_EXPO_PATH,
+      cwd: workspace.expoPath,
       stdio: 'pipe',
     });
 
     currentExpoProcess.stdout?.on('data', (data) => {
-      const text = data.toString().trim();
-      console.log(`[EXPO] ${text}`);
+      console.log(`[EXPO] ${data.toString().trim()}`);
     });
 
     currentExpoProcess.stderr?.on('data', (data) => {
-      const text = data.toString().trim();
-      console.log(`[EXPO:ERR] ${text}`);
+      console.log(`[EXPO:ERR] ${data.toString().trim()}`);
     });
 
     let isResolved = false;

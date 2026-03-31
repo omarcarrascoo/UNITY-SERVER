@@ -3,7 +3,7 @@ import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs';
 import path from 'path';
-import { TARGET_REPO_PATH } from './config.js';
+import { getDefaultProject } from './config.js';
 
 export interface GeneratedFile { filepath: string; code: string; }
 export interface AIResponse { targetRoute: string; commitMessage: string; files: GeneratedFile[]; }
@@ -14,6 +14,7 @@ export async function generateAndWriteCode(
     figmaData: string | null, 
     projectContext: string
 ): Promise<{ targetRoute: string, commitMessage: string }> {
+    const targetRepoPath = getDefaultProject().repoPath;
     const provider = process.env.AI_PROVIDER || 'gemini';
     console.log(`🧠 AI Engine Initialized: ${provider.toUpperCase()}`);
 
@@ -98,7 +99,7 @@ export async function generateAndWriteCode(
         const commitMessage = parsedData.commitMessage || 'feat: auto-update from AI';
 
         for (const file of filesToCreate) {
-            const fullPath = path.join(TARGET_REPO_PATH, file.filepath);
+            const fullPath = path.join(targetRepoPath, file.filepath);
             const dir = path.dirname(fullPath);
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
             fs.writeFileSync(fullPath, file.code);

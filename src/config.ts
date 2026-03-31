@@ -1,22 +1,62 @@
 import path from 'path';
 import 'dotenv/config';
-
 import { fileURLToPath } from 'url';
-import 'dotenv/config';
-
-
-
-
+import type { WorkspaceProject } from './domain/runtime.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-export const WORKSPACE_DIR: string = path.resolve(__dirname, '../workspaces');
-// Mutable pointer to the currently active repository inside WORKSPACE_DIR.
-export let TARGET_REPO_PATH: string = path.join(WORKSPACE_DIR, process.env.GITHUB_REPO as string);
+export const PROJECT_ROOT = path.resolve(__dirname, '..');
+export const WORKSPACE_DIR = path.resolve(PROJECT_ROOT, 'workspaces');
 
-// Switches the active repository context used by all runtime modules.
-export function setActiveProject(repoName: string) {
-    TARGET_REPO_PATH = path.join(WORKSPACE_DIR, repoName);
-    process.env.GITHUB_REPO = repoName;
+export interface RuntimeConfig {
+  workspaceDir: string;
+  githubOwner: string;
+  githubRepo: string;
+  githubToken: string;
+  githubBaseBranch: string;
+  discordToken: string;
+  discordClientId: string;
+  figmaToken?: string;
+  deepseekApiKey?: string;
+}
+
+function getRequiredEnv(name: string): string {
+  const value = process.env[name];
+
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+
+  return value;
+}
+
+export function getRuntimeConfig(): RuntimeConfig {
+  return {
+    workspaceDir: WORKSPACE_DIR,
+    githubOwner: getRequiredEnv('GITHUB_OWNER'),
+    githubRepo: getRequiredEnv('GITHUB_REPO'),
+    githubToken: getRequiredEnv('GITHUB_TOKEN'),
+    githubBaseBranch: process.env.GITHUB_BASE_BRANCH || 'main',
+    discordToken: getRequiredEnv('DISCORD_TOKEN'),
+    discordClientId: getRequiredEnv('DISCORD_CLIENT_ID'),
+    figmaToken: process.env.FIGMA_TOKEN,
+    deepseekApiKey: process.env.DEEPSEEK_API_KEY,
+  };
+}
+
+export function buildRepoPath(repoName: string): string {
+  return path.join(WORKSPACE_DIR, repoName);
+}
+
+export function getProjectByName(repoName: string): WorkspaceProject {
+  return {
+    name: repoName,
+    repoPath: buildRepoPath(repoName),
+    workspaceDir: WORKSPACE_DIR,
+  };
+}
+
+export function getDefaultProject(): WorkspaceProject {
+  return getProjectByName(getRuntimeConfig().githubRepo);
 }

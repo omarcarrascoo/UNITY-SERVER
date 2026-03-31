@@ -2,7 +2,6 @@ import fs from 'fs';
 import path from 'path';
 import { exec } from 'child_process';
 import util from 'util';
-import { TARGET_REPO_PATH } from './config.js';
 
 const execPromise = util.promisify(exec);
 
@@ -21,17 +20,22 @@ const IGNORE_DIRS = new Set([
 const SOURCE_FILE_REGEX = /\.(ts|tsx|js|jsx|json|md)$/i;
 const SAFE_NPM_RUN_SCRIPTS = new Set(['lint', 'test', 'typecheck', 'build', 'start']);
 
-function getRepoRoot(): string {
-  return path.resolve(TARGET_REPO_PATH);
+export interface AgentToolRuntime {
+  tools: typeof agentTools;
+  readFile: (filepath: string, startLine?: number, endLine?: number) => string;
+  searchProject: (keyword: string, maxResults?: number) => string;
+  runCommand: (cmd: string) => Promise<string>;
 }
 
-// Prevents path traversal when the model requests file reads.
-function resolveSafePath(relativePath: string): string {
+function resolveRepoRoot(repoPath: string): string {
+  return path.resolve(repoPath);
+}
+
+function resolveSafePath(repoRoot: string, relativePath: string): string {
   if (typeof relativePath !== 'string' || !relativePath.trim()) {
     throw new Error('Invalid path: expected non-empty relative path string.');
   }
 
-  const repoRoot = getRepoRoot();
   const fullPath = path.resolve(repoRoot, relativePath);
 
   if (fullPath !== repoRoot && !fullPath.startsWith(`${repoRoot}${path.sep}`)) {
@@ -41,15 +45,14 @@ function resolveSafePath(relativePath: string): string {
   return fullPath;
 }
 
-// Returns a numbered line window so model edits can target exact ranges.
 function lineSlice(content: string, startLine = 1, endLine = 300): string {
   const lines = content.split('\n');
   const safeStart = Math.max(1, Math.floor(startLine));
   const safeEnd = Math.max(safeStart, Math.floor(endLine));
   const clippedEnd = Math.min(lines.length, safeEnd);
 
-  const selected = lines.slice(safeStart - 1, clippedEnd);
-  return selected
+  return lines
+    .slice(safeStart - 1, clippedEnd)
     .map((line, index) => {
       const lineNumber = String(safeStart + index).padStart(4, ' ');
       return `${lineNumber}| ${line}`;
@@ -57,22 +60,22 @@ function lineSlice(content: string, startLine = 1, endLine = 300): string {
     .join('\n');
 }
 
-// Exposed tool: bounded file reader with stable "FILE/LINES" envelope format.
-export function readFile(filepath: string, startLine = 1, endLine = 300): string {
-  try {
-    const repoRoot = getRepoRoot();
-    const fullPath = resolveSafePath(filepath);
+function createReadFile(repoRoot: string) {
+  return (filepath: string, startLine = 1, endLine = 300): string => {
+    try {
+      const fullPath = resolveSafePath(repoRoot, filepath);
 
-    if (!fs.existsSync(fullPath)) return `Error: file "${filepath}" does not exist.`;
-    if (!fs.statSync(fullPath).isFile()) return `Error: path "${filepath}" is not a file.`;
+      if (!fs.existsSync(fullPath)) return `Error: file "${filepath}" does not exist.`;
+      if (!fs.statSync(fullPath).isFile()) return `Error: path "${filepath}" is not a file.`;
 
-    const content = fs.readFileSync(fullPath, 'utf8');
-    const relative = path.relative(repoRoot, fullPath);
+      const content = fs.readFileSync(fullPath, 'utf8');
+      const relative = path.relative(repoRoot, fullPath);
 
-    return `FILE: ${relative}\nLINES: ${startLine}-${endLine}\n\n${lineSlice(content, startLine, endLine)}`;
-  } catch (error: any) {
-    return `Error reading file "${filepath}": ${error.message}`;
-  }
+      return `FILE: ${relative}\nLINES: ${startLine}-${endLine}\n\n${lineSlice(content, startLine, endLine)}`;
+    } catch (error: any) {
+      return `Error reading file "${filepath}": ${error.message}`;
+    }
+  };
 }
 
 interface SearchHit {
@@ -80,16 +83,15 @@ interface SearchHit {
   lines: Array<{ line: number; text: string }>;
 }
 
-// DFS over source files with an early stop to control token and runtime cost.
 function collectSearchHits(
+  repoRoot: string,
   keyword: string,
   maxResults: number,
-  dir = getRepoRoot(),
+  dir = repoRoot,
   hits: SearchHit[] = [],
 ): SearchHit[] {
   if (hits.length >= maxResults) return hits;
 
-  const repoRoot = getRepoRoot();
   const entries = fs.readdirSync(dir, { withFileTypes: true });
 
   for (const entry of entries) {
@@ -99,7 +101,7 @@ function collectSearchHits(
 
     if (entry.isDirectory()) {
       if (!IGNORE_DIRS.has(entry.name)) {
-        collectSearchHits(keyword, maxResults, fullPath, hits);
+        collectSearchHits(repoRoot, keyword, maxResults, fullPath, hits);
       }
       continue;
     }
@@ -113,9 +115,9 @@ function collectSearchHits(
       const matches: Array<{ line: number; text: string }> = [];
       const lines = content.split('\n');
 
-      for (let i = 0; i < lines.length; i++) {
-        if (lines[i].toLowerCase().includes(keyword.toLowerCase())) {
-          matches.push({ line: i + 1, text: lines[i].trim() });
+      for (let index = 0; index < lines.length; index++) {
+        if (lines[index].toLowerCase().includes(keyword.toLowerCase())) {
+          matches.push({ line: index + 1, text: lines[index].trim() });
           if (matches.length >= 3) break;
         }
       }
@@ -132,31 +134,32 @@ function collectSearchHits(
   return hits;
 }
 
-// Exposed tool: case-insensitive keyword search with compact per-file snippets.
-export function searchProject(keyword: string, maxResults = 30): string {
-  try {
-    if (typeof keyword !== 'string' || !keyword.trim()) {
-      return 'Error: keyword must be a non-empty string.';
+function createSearchProject(repoRoot: string) {
+  return (keyword: string, maxResults = 30): string => {
+    try {
+      if (typeof keyword !== 'string' || !keyword.trim()) {
+        return 'Error: keyword must be a non-empty string.';
+      }
+
+      const safeLimit = Math.min(100, Math.max(1, Math.floor(maxResults)));
+      const hits = collectSearchHits(repoRoot, keyword.trim(), safeLimit);
+
+      if (!hits.length) return `No matches found for "${keyword}".`;
+
+      const output = hits
+        .map((hit) => {
+          const snippets = hit.lines
+            .map((line) => `  ${String(line.line).padStart(4, ' ')}| ${line.text}`)
+            .join('\n');
+          return `- ${hit.file}\n${snippets}`;
+        })
+        .join('\n');
+
+      return `Keyword "${keyword}" found in ${hits.length} file(s):\n${output}`;
+    } catch (error: any) {
+      return `Error during search_project: ${error.message}`;
     }
-
-    const safeLimit = Math.min(100, Math.max(1, Math.floor(maxResults)));
-    const hits = collectSearchHits(keyword.trim(), safeLimit, getRepoRoot());
-
-    if (!hits.length) return `No matches found for "${keyword}".`;
-
-    const output = hits
-      .map((hit) => {
-        const snippets = hit.lines
-          .map((l) => `  ${String(l.line).padStart(4, ' ')}| ${l.text}`)
-          .join('\n');
-        return `- ${hit.file}\n${snippets}`;
-      })
-      .join('\n');
-
-    return `Keyword "${keyword}" found in ${hits.length} file(s):\n${output}`;
-  } catch (error: any) {
-    return `Error during search_project: ${error.message}`;
-  }
+  };
 }
 
 function isSafeCdCommand(command: string): boolean {
@@ -169,19 +172,14 @@ function isSafeCdCommand(command: string): boolean {
     return false;
   }
 
-  if (path.isAbsolute(target)) {
-    return false;
-  }
-
-  return true;
+  return !path.isAbsolute(target);
 }
 
 function isSafeNpmRunCommand(command: string): boolean {
   const match = command.match(/^npm\s+run\s+([a-zA-Z0-9:_-]+)(?:\s+--.*)?$/);
   if (!match) return false;
 
-  const scriptName = match[1];
-  return SAFE_NPM_RUN_SCRIPTS.has(scriptName);
+  return SAFE_NPM_RUN_SCRIPTS.has(match[1]);
 }
 
 function isAllowedSubCommand(command: string): boolean {
@@ -206,70 +204,79 @@ function isAllowedSubCommand(command: string): boolean {
   return false;
 }
 
-// Exposed tool: command runner with path guards and explicit command allowlist.
-export async function runCommand(cmd: string): Promise<string> {
-  const trimmedCmd = cmd.trim();
-  const repoRoot = getRepoRoot();
+function createRunCommand(repoRoot: string) {
+  return async (cmd: string): Promise<string> => {
+    const trimmedCmd = cmd.trim();
 
-  if (!trimmedCmd) {
-    return '🚨 SECURITY EXCEPTION: Command rejected. Empty command.';
-  }
-
-  // Reject traversal and shell features that significantly widen execution surface.
-  const blockedPatterns = [
-    /\.\.\//,
-    /(^|\s)\/(?!dev|tmp)/,
-    /~/,
-    /;/,
-    /\|\|/,
-    /(^|[^|])\|([^|]|$)/,
-    />/,
-    /</,
-    /(^|[^&])&([^&]|$)/,
-  ];
-
-  for (const pattern of blockedPatterns) {
-    if (pattern.test(trimmedCmd)) {
-      console.log(`🚨 SECURITY BLOCK: Unsafe shell pattern in command: ${trimmedCmd}`);
-      return '🚨 SECURITY EXCEPTION: Command rejected. Unsafe shell operators are not allowed.';
+    if (!trimmedCmd) {
+      return '🚨 SECURITY EXCEPTION: Command rejected. Empty command.';
     }
-  }
 
-  const subCommands = trimmedCmd
-    .split('&&')
-    .map((s) => s.trim())
-    .filter(Boolean);
+    const blockedPatterns = [
+      /\.\.\//,
+      /(^|\s)\/(?!dev|tmp)/,
+      /~/,
+      /;/,
+      /\|\|/,
+      /(^|[^|])\|([^|]|$)/,
+      />/,
+      /</,
+      /(^|[^&])&([^&]|$)/,
+    ];
 
-  if (subCommands.length === 0) {
-    return '🚨 SECURITY EXCEPTION: Command rejected. No valid subcommands found.';
-  }
-
-  for (const subCmd of subCommands) {
-    if (!isAllowedSubCommand(subCmd)) {
-      console.log(`🚨 SECURITY BLOCK: Unauthorized command attempted: ${subCmd}`);
-      return '🚨 SECURITY EXCEPTION: Command rejected. Only safe development commands are allowed.';
+    for (const pattern of blockedPatterns) {
+      if (pattern.test(trimmedCmd)) {
+        console.log(`🚨 SECURITY BLOCK: Unsafe shell pattern in command: ${trimmedCmd}`);
+        return '🚨 SECURITY EXCEPTION: Command rejected. Unsafe shell operators are not allowed.';
+      }
     }
-  }
 
-  try {
-    console.log(`💻 Executing safe command in ${repoRoot}: ${trimmedCmd}`);
-    const { stdout, stderr } = await execPromise(trimmedCmd, {
-      cwd: repoRoot,
-      timeout: 20000,
-    });
+    const subCommands = trimmedCmd
+      .split('&&')
+      .map((segment) => segment.trim())
+      .filter(Boolean);
 
-    let output = '';
-    if (stdout) output += `STDOUT:\n${stdout}\n`;
-    if (stderr) output += `STDERR:\n${stderr}\n`;
+    if (subCommands.length === 0) {
+      return '🚨 SECURITY EXCEPTION: Command rejected. No valid subcommands found.';
+    }
 
-    return output.trim() ? output.trim() : 'Command executed successfully with no output.';
-  } catch (error: any) {
-    return `⚠️ Command failed:\nSTDOUT:\n${error.stdout}\nSTDERR:\n${error.stderr}\nMESSAGE:\n${error.message}`;
-  }
+    for (const subCommand of subCommands) {
+      if (!isAllowedSubCommand(subCommand)) {
+        console.log(`🚨 SECURITY BLOCK: Unauthorized command attempted: ${subCommand}`);
+        return '🚨 SECURITY EXCEPTION: Command rejected. Only safe development commands are allowed.';
+      }
+    }
+
+    try {
+      console.log(`💻 Executing safe command in ${repoRoot}: ${trimmedCmd}`);
+      const { stdout, stderr } = await execPromise(trimmedCmd, {
+        cwd: repoRoot,
+        timeout: 20000,
+      });
+
+      let output = '';
+      if (stdout) output += `STDOUT:\n${stdout}\n`;
+      if (stderr) output += `STDERR:\n${stderr}\n`;
+
+      return output.trim() ? output.trim() : 'Command executed successfully with no output.';
+    } catch (error: any) {
+      return `⚠️ Command failed:\nSTDOUT:\n${error.stdout}\nSTDERR:\n${error.stderr}\nMESSAGE:\n${error.message}`;
+    }
+  };
 }
 
-// JSON schemas exposed to the LLM as callable function tools.
-export const agentTools: any[] = [
+export function createAgentToolRuntime(repoPath: string): AgentToolRuntime {
+  const repoRoot = resolveRepoRoot(repoPath);
+
+  return {
+    tools: agentTools,
+    readFile: createReadFile(repoRoot),
+    searchProject: createSearchProject(repoRoot),
+    runCommand: createRunCommand(repoRoot),
+  };
+}
+
+export const agentTools = [
   {
     type: 'function',
     function: {
@@ -305,7 +312,7 @@ export const agentTools: any[] = [
     type: 'function',
     function: {
       name: 'run_command',
-      description: 'Executes a bash shell command in the repository root. Use this to install missing npm packages (e.g., "npm install dayjs"), run safe scripts like lint/test/typecheck/build/start, run linters/compilers (e.g., "npx tsc --noEmit"), or check git history (e.g., "git status" or "git diff"). Note: To install in a sub-folder of a monorepo, use cd (e.g., "cd kubo-mobile && npm install lucide-react-native").',
+      description: 'Executes a bash shell command in the repository root. Use this to install missing npm packages, run safe scripts like lint/test/typecheck/build/start, run compilers, or inspect git history. To install in a sub-folder of a monorepo, use cd first.',
       parameters: {
         type: 'object',
         properties: {
@@ -315,4 +322,4 @@ export const agentTools: any[] = [
       },
     },
   },
-];
+] as const;
