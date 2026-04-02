@@ -65,9 +65,39 @@ interface ExecutedTaskResult {
 
 const ADVISORY_TITLE_PATTERN =
   /^(analy[sz]e|analy[sz]ing|analysis|analizar|revisar|review|inspect|investigate|diagnose|audit|explore)\b/i;
+const RUN_CLOSING_WINDOW_MS = 10 * 60 * 1000;
+
+interface RunBudgetState {
+  remainingMs: number;
+  inClosingWindow: boolean;
+  exhausted: boolean;
+}
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function formatRemainingTime(remainingMs: number): string {
+  const safeMs = Math.max(0, remainingMs);
+  const totalMinutes = Math.ceil(safeMs / 60000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+
+  if (hours <= 0) {
+    return `${minutes} minute(s)`;
+  }
+
+  return `${hours} hour(s) ${minutes} minute(s)`;
+}
+
+function getRunBudgetState(deadline: number): RunBudgetState {
+  const remainingMs = deadline - Date.now();
+
+  return {
+    remainingMs,
+    inClosingWindow: remainingMs <= RUN_CLOSING_WINDOW_MS,
+    exhausted: remainingMs <= 0,
+  };
 }
 
 function hasScopeConflict(left: string[], right: string[]): boolean {
@@ -170,8 +200,22 @@ function getOutOfScopePaths(workspace: PreparedWorkspace, diff: string, scopes: 
   });
 }
 
-function buildScopedTaskPrompt(task: TaskRecord, runPrompt: string, dependencyContext: string): string {
+function buildScopedTaskPrompt(
+  task: TaskRecord,
+  runPrompt: string,
+  dependencyContext: string,
+  options?: { inClosingWindow?: boolean; remainingMs?: number },
+): string {
   const scopes = normalizeScopes(task.writeScope);
+  const budgetInstructions = options?.inClosingWindow
+    ? `
+
+Time budget warning:
+- The run is inside its final closing window with about ${formatRemainingTime(options.remainingMs || 0)} remaining.
+- Prioritize finishing the smallest viable change for this task.
+- Do not expand scope, start adjacent refactors, or generate optional follow-up work unless absolutely necessary for correctness.
+- Prefer wrapping up cleanly over chasing ideal completion.`
+    : '';
 
   return `Run goal:
 ${runPrompt}
@@ -187,6 +231,7 @@ Rules:
 - Focus on this task's scope and ignore unrelated failures elsewhere in the repo.
 - Only touch files outside the task scope when they are directly required to complete the scoped change.
 - Prefer the smallest correct implementation that clears scoped validation.
+${budgetInstructions}
 
 Dependency context:
 ${dependencyContext || '(none)'}
@@ -344,6 +389,7 @@ async function executeTask(
   policy: AutonomousRunPolicy,
   signal: AbortSignal | undefined,
   dependencyContext: string,
+  options?: { inClosingWindow?: boolean; remainingMs?: number },
   onProgress?: (message: string) => Promise<void>,
 ): Promise<ExecutedTaskResult> {
   const taskWorktree = await createTaskWorktree(baseWorkspace, run.id, task.id, run.branchName);
@@ -360,7 +406,7 @@ async function executeTask(
     const projectTree = getProjectTree(taskWorktree.workspace.repoPath);
     const execution = await generateAndWriteCode({
       repoPath: taskWorktree.workspace.repoPath,
-      userPrompt: buildScopedTaskPrompt(task, run.prompt, dependencyContext),
+      userPrompt: buildScopedTaskPrompt(task, run.prompt, dependencyContext, options),
       figmaData,
       projectTree,
       projectMemory,
@@ -626,14 +672,44 @@ export async function runAutonomousAgent({
   }
 
   const deadline = Date.now() + policy.maxHours * 60 * 60 * 1000;
+  let closingWindowAnnounced = false;
+  let gracefulDrainRequested = false;
   let commitsCreated = 0;
   let improvementCycle = 0;
   let pendingImprovementDrafts: PlanTaskDraft[] = [];
   let latestTargetRoute = '/';
 
-  while (Date.now() < deadline && commitsCreated < policy.maxCommits) {
+  while (commitsCreated < policy.maxCommits) {
     if (signal?.aborted) {
       throw new Error('AbortError');
+    }
+
+    const budgetState = getRunBudgetState(deadline);
+
+    if (budgetState.inClosingWindow && !closingWindowAnnounced) {
+      closingWindowAnnounced = true;
+      gracefulDrainRequested = true;
+
+      unityStore.addEvent(
+        createEntityId('event'),
+        run.id,
+        null,
+        'warning',
+        'run.closing_window',
+        `Run entered closing window with about ${formatRemainingTime(budgetState.remainingMs)} remaining.`,
+      );
+
+      if (onProgress) {
+        await onProgress(
+          `⏳ Unity Agent entered its final closing window with about ${formatRemainingTime(
+            budgetState.remainingMs,
+          )} remaining. It will stop opening new improvement cycles and focus on wrapping up cleanly.`,
+        );
+      }
+    }
+
+    if (budgetState.exhausted) {
+      break;
     }
 
     const allTasks = unityStore.listTasksByRun(run.id);
@@ -661,6 +737,7 @@ export async function runAutonomousAgent({
 
       if (
         pendingImprovementDrafts.length > 0 &&
+        !gracefulDrainRequested &&
         improvementCycle < policy.maxImprovementCycles &&
         commitsCreated < policy.maxCommits
       ) {
@@ -704,6 +781,10 @@ export async function runAutonomousAgent({
           policy,
           signal,
           buildDependencyContext(task, allTasks),
+          {
+            inClosingWindow: budgetState.inClosingWindow,
+            remainingMs: budgetState.remainingMs,
+          },
           onProgress,
         ),
       ),
@@ -747,10 +828,12 @@ export async function runAutonomousAgent({
             },
           );
 
-          pendingImprovementDrafts.push(...result.review.followUpTasks);
+          if (!gracefulDrainRequested) {
+            pendingImprovementDrafts.push(...result.review.followUpTasks);
+          }
         } catch (error: any) {
           const validationSummary = `Integration failed: ${error.message || String(error)}`;
-          if (task.attempts < policy.maxRetriesPerTask) {
+          if (task.attempts < policy.maxRetriesPerTask && !gracefulDrainRequested) {
             unityStore.updateTask(task.id, {
               status: 'pending',
               prompt: buildRetryPrompt(task, validationSummary),
@@ -785,7 +868,7 @@ export async function runAutonomousAgent({
       }
 
       const validationSummary = result.outcome.validationSummary || 'Task failed validation.';
-      if (task.attempts < policy.maxRetriesPerTask) {
+      if (task.attempts < policy.maxRetriesPerTask && !gracefulDrainRequested) {
         unityStore.updateTask(task.id, {
           status: 'pending',
           prompt: buildRetryPrompt(task, validationSummary),
@@ -818,12 +901,18 @@ export async function runAutonomousAgent({
         );
       }
     }
+
+    if (gracefulDrainRequested) {
+      break;
+    }
   }
 
-  if (Date.now() >= deadline || commitsCreated >= policy.maxCommits) {
+  if (getRunBudgetState(deadline).exhausted || commitsCreated >= policy.maxCommits || gracefulDrainRequested) {
     const blockingReason =
-      Date.now() >= deadline
+      getRunBudgetState(deadline).exhausted
         ? `Run reached the max execution window of ${policy.maxHours} hour(s).`
+        : gracefulDrainRequested
+          ? `Run entered the final closing window and stopped scheduling new work to finish cleanly.`
         : `Run reached the max commit budget of ${policy.maxCommits}.`;
 
     for (const task of unityStore.listTasksByRun(run.id).filter((candidate) => candidate.status === 'pending')) {

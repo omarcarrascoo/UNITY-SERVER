@@ -58,7 +58,7 @@ function getBaseBranch(): string {
 
 function getRepoUrl(project: WorkspaceProject): string {
   const config = getRuntimeConfig();
-  return `https://${config.githubToken}@github.com/${config.githubOwner}/${project.name}.git`;
+  return `https://github.com/${config.githubOwner}/${project.name}.git`;
 }
 
 function scanWorkspaceTargets(basePath: string): WorkspaceTargets {

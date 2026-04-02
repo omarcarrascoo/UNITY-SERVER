@@ -20,6 +20,7 @@ import { getRepositoryStatus, prepareWorkspace } from '../../git.js';
 import { getProjectPolicy, normalizePolicy } from '../../services/orchestration/policy-engine.js';
 
 const runtimeConfig = getRuntimeConfig();
+const DISCORD_CONTENT_LIMIT = 3800;
 
 function formatAgentStatus(statusMsg: string, thought?: string): string {
   let logMessage = `**${statusMsg}**`;
@@ -29,6 +30,67 @@ function formatAgentStatus(statusMsg: string, thought?: string): string {
   }
 
   return logMessage;
+}
+
+function chunkDiscordContent(content: string, limit = DISCORD_CONTENT_LIMIT): string[] {
+  if (content.length <= limit) {
+    return [content];
+  }
+
+  const chunks: string[] = [];
+  let remaining = content;
+
+  while (remaining.length > limit) {
+    const slice = remaining.slice(0, limit);
+    const breakIndex = Math.max(slice.lastIndexOf('\n'), slice.lastIndexOf(' '));
+
+    if (breakIndex > Math.floor(limit * 0.6)) {
+      chunks.push(remaining.slice(0, breakIndex).trimEnd());
+      remaining = remaining.slice(breakIndex + 1);
+    } else {
+      chunks.push(remaining.slice(0, limit).trimEnd());
+      remaining = remaining.slice(limit);
+    }
+  }
+
+  if (remaining.trim()) {
+    chunks.push(remaining.trim());
+  }
+
+  return chunks;
+}
+
+async function sendChunkedThreadMessages(thread: any, content: string): Promise<void> {
+  for (const chunk of chunkDiscordContent(content)) {
+    await thread.send(chunk).catch(() => {});
+  }
+}
+
+function buildAutonomousHeadline(result: {
+  runId: string;
+  branchName: string;
+  defaultBranch: string;
+  commitsCreated: number;
+  runtimeUrls: { localUrl: string | null; publicUrl: string | null };
+  tasks: Array<{ status: string }>;
+}): string {
+  const succeeded = result.tasks.filter((task) => task.status === 'succeeded').length;
+  const failed = result.tasks.filter((task) => task.status === 'failed').length;
+  const blocked = result.tasks.filter((task) => task.status === 'blocked').length;
+  const skipped = result.tasks.filter((task) => task.status === 'skipped').length;
+
+  return [
+    '✅ **Unity Agent Run Complete**',
+    `🆔 Run: \`${result.runId}\``,
+    `🌿 Branch: \`${result.branchName}\``,
+    `🔀 Merge target later: \`${result.defaultBranch}\``,
+    `🧱 Commits created: \`${result.commitsCreated}\``,
+    `📊 Tasks: succeeded \`${succeeded}\` | failed \`${failed}\` | blocked \`${blocked}\` | skipped \`${skipped}\``,
+    `🏠 Local: ${result.runtimeUrls.localUrl || 'Unavailable'}`,
+    `📱 Public: ${result.runtimeUrls.publicUrl || 'Unavailable'}`,
+    '',
+    'Detailed summary posted in the thread.',
+  ].join('\n');
 }
 
 function buildSessionButtonId(
@@ -138,15 +200,15 @@ export function registerDiscordHandlers(client: Client, runtime: RuntimeState): 
           .map((task) => `- ${task.status.toUpperCase()} ${task.title}${task.commitMessage ? ` -> ${task.commitMessage}` : ''}`)
           .join('\n');
 
-        const finalContent = `✅ **Unity Agent Run Complete**\n🆔 Run: \`${result.runId}\`\n🌿 Branch: \`${result.branchName}\`\n🔀 Merge target later: \`${result.defaultBranch}\`\n🧱 Commits created: \`${result.commitsCreated}\`\n🏠 Local: ${result.runtimeUrls.localUrl || 'Unavailable'}\n📱 Public: ${result.runtimeUrls.publicUrl || 'Unavailable'}\n\n${result.summary}`;
-
         await replyMessage.edit({
-          content: finalContent,
+          content: buildAutonomousHeadline(result),
           components: [],
         });
 
+        await sendChunkedThreadMessages(thread, `**Run Summary**\n${result.summary}`);
+
         if (taskLines) {
-          await thread.send(`**Task Results**\n${taskLines}`);
+          await sendChunkedThreadMessages(thread, `**Task Results**\n${taskLines}`);
         }
 
         await thread.setArchived(true);

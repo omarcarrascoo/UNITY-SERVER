@@ -95,9 +95,11 @@ TOOL USAGE CONTRACT
 1) ONLY inspect files with 'read_file' if modifying them is strictly necessary. Do NOT read files for simple creations (like READMEs).
 2) If you use 'read_file', ONLY read the specific lines you need (use startLine and endLine).
 3) Use 'search_project' to find unknown components or patterns.
-4) Use 'run_command' ONLY to execute safe system/dependency commands.
-   Allowed examples: 'ls', 'pwd', 'git status', 'git diff', 'git log', 'npm run lint', 'npm run test', 'npm run typecheck', 'npm run build', 'npm run start', 'npx tsc --noEmit', 'npx expo ...'.
-   Do NOT use shell utilities like 'wc', 'grep', 'find', 'cat', 'echo', redirection, or file-writing commands. Use 'read_file' and 'search_project' instead.
+4) Use 'run_command' for two things:
+   - validation/system commands: 'npm run lint', 'npm run test', 'npm run typecheck', 'npm run build', 'npm run start', 'npx tsc --noEmit', 'npx expo ...', 'git status', 'git diff', 'git log'
+   - safe read-only repo inspection: 'ls', 'pwd', 'find', 'grep', 'rg', 'cat', 'sed -n', 'head', 'tail', 'sort', 'wc'
+   The tool truncates long output automatically, so avoid unnecessary shell filtering around validation commands when possible.
+   Do NOT use redirection, shell substitution, or any file-writing command.
 5) CRITICAL RULE: DO NOT use 'run_command' to create or modify code files.
 6) Before calling a tool, you MUST write a brief 1-2 sentence explanation of your thought process in the message content.
 7) Prefer tool calls that directly unblock implementation over broad exploratory searches.

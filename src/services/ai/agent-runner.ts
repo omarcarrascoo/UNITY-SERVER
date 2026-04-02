@@ -12,7 +12,7 @@ import {
   isFatalRuntimeError,
   isFatalToolError,
 } from './loop-heuristics.js';
-import { createDeepseekClient } from './client.js';
+import { createDeepseekChatCompletion } from './client.js';
 import type { AIResponse, GenerateCodeParams } from './types.js';
 
 function isFunctionToolCall(
@@ -31,7 +31,6 @@ export async function generateAndWriteCode({
   onStatusUpdate,
   signal,
 }: GenerateCodeParams): Promise<{ targetRoute: string; commitMessage: string; tokenUsage: number }> {
-  const client = createDeepseekClient();
   const toolRuntime = createAgentToolRuntime(repoPath);
   const messages: any[] = [
     {
@@ -58,7 +57,7 @@ export async function generateAndWriteCode({
     const statusMsg = `🔄 Iteration ${loop}... Thinking...`;
     if (onStatusUpdate) onStatusUpdate(statusMsg);
 
-    const response = await client.chat.completions.create(
+    const response = await createDeepseekChatCompletion(
       {
         model: 'deepseek-reasoner',
         messages,

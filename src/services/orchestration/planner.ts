@@ -1,4 +1,4 @@
-import { createDeepseekClient } from '../ai/client.js';
+import { createDeepseekChatCompletion } from '../ai/client.js';
 import { parseJsonObject } from '../ai/edit-operations.js';
 import type { PlanTaskDraft, RunPlanDraft } from '../../domain/orchestration.js';
 
@@ -114,10 +114,8 @@ RETURN JSON ONLY:
 }
 
 export async function planAutonomousRun(params: PlanRunParams): Promise<RunPlanDraft> {
-  const client = createDeepseekClient();
-
   try {
-    const response = await client.chat.completions.create({
+    const response = await createDeepseekChatCompletion({
       model: 'deepseek-chat',
       temperature: 0.2,
       max_tokens: 2200,
