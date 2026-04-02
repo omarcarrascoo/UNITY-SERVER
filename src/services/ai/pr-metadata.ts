@@ -12,7 +12,7 @@ ${diff.substring(0, 6000)}`;
 
   try {
     const response = await client.chat.completions.create({
-      model: 'deepseek-chat',
+      model: 'deepseek-reasoner',
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.3,
       max_tokens: 500,

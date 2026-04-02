@@ -8,9 +8,11 @@ const __dirname = path.dirname(__filename);
 
 export const PROJECT_ROOT = path.resolve(__dirname, '..');
 export const WORKSPACE_DIR = path.resolve(PROJECT_ROOT, 'workspaces');
+export const DATA_DIR = path.resolve(PROJECT_ROOT, '.unity');
 
 export interface RuntimeConfig {
   workspaceDir: string;
+  dataDir: string;
   githubOwner: string;
   githubRepo: string;
   githubToken: string;
@@ -19,6 +21,9 @@ export interface RuntimeConfig {
   discordClientId: string;
   figmaToken?: string;
   deepseekApiKey?: string;
+  manualChannelName: string;
+  autonomousChannelName: string;
+  integrationBranchName: string;
 }
 
 function getRequiredEnv(name: string): string {
@@ -34,6 +39,7 @@ function getRequiredEnv(name: string): string {
 export function getRuntimeConfig(): RuntimeConfig {
   return {
     workspaceDir: WORKSPACE_DIR,
+    dataDir: DATA_DIR,
     githubOwner: getRequiredEnv('GITHUB_OWNER'),
     githubRepo: getRequiredEnv('GITHUB_REPO'),
     githubToken: getRequiredEnv('GITHUB_TOKEN'),
@@ -42,6 +48,9 @@ export function getRuntimeConfig(): RuntimeConfig {
     discordClientId: getRequiredEnv('DISCORD_CLIENT_ID'),
     figmaToken: process.env.FIGMA_TOKEN,
     deepseekApiKey: process.env.DEEPSEEK_API_KEY,
+    manualChannelName: process.env.UNITY_MANUAL_CHANNEL || 'jarvis-dev',
+    autonomousChannelName: process.env.UNITY_AUTONOMOUS_CHANNEL || 'unity-agent',
+    integrationBranchName: process.env.UNITY_INTEGRATION_BRANCH || 'unity-per-development',
   };
 }
 

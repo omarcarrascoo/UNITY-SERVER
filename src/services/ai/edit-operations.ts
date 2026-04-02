@@ -20,6 +20,35 @@ export function extractJsonObject(raw: string): string {
   throw new Error('No JSON object found.');
 }
 
+export function repairJsonObject(raw: string): string {
+  return raw
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/,\s*([}\]])/g, '$1')
+    .replace(/}\s*([\r\n]+)\s*{/g, '},$1{')
+    .replace(/]\s*([\r\n]+)\s*\[/g, '],$1[')
+    .replace(/"\s*([\r\n]+)\s*"/g, '",$1"')
+    .trim();
+}
+
+export function parseJsonObject<T>(raw: string): T {
+  const extracted = extractJsonObject(raw);
+
+  try {
+    return JSON.parse(extracted) as T;
+  } catch (originalError: any) {
+    const repaired = repairJsonObject(extracted);
+
+    try {
+      return JSON.parse(repaired) as T;
+    } catch (repairError: any) {
+      throw new Error(
+        `Failed to parse model JSON. Original error: ${originalError?.message || String(originalError)}. Repaired error: ${repairError?.message || String(repairError)}.`,
+      );
+    }
+  }
+}
+
 function resolveSafeFilePath(repoPath: string, relativeFilePath: string): string {
   const repoRoot = path.resolve(repoPath);
   const fullPath = path.resolve(repoRoot, relativeFilePath);
@@ -101,4 +130,3 @@ export function getDirsToCheck(edits: FileEdit[]): string[] {
     ),
   );
 }
-

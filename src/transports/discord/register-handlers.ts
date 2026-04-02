@@ -1,6 +1,7 @@
 import {
   ActionRowBuilder,
   AttachmentBuilder,
+  ButtonInteraction,
   ButtonBuilder,
   ButtonStyle,
   Client,
@@ -8,12 +9,17 @@ import {
   Message,
 } from 'discord.js';
 import { approveSession } from '../../application/approve-session.js';
+import { runAutonomousAgent } from '../../application/run-autonomous-agent.js';
 import { runDevelopmentTask } from '../../application/run-development-task.js';
 import { initProject } from '../../application/projects/init-project.js';
 import { rejectSession } from '../../application/reject-session.js';
-import { getProjectByName } from '../../config.js';
+import { getProjectByName, getRuntimeConfig } from '../../config.js';
 import { RuntimeState } from '../../runtime/state.js';
+import { unityStore } from '../../runtime/services.js';
 import { getRepositoryStatus, prepareWorkspace } from '../../git.js';
+import { getProjectPolicy, normalizePolicy } from '../../services/orchestration/policy-engine.js';
+
+const runtimeConfig = getRuntimeConfig();
 
 function formatAgentStatus(statusMsg: string, thought?: string): string {
   let logMessage = `**${statusMsg}**`;
@@ -25,9 +31,149 @@ function formatAgentStatus(statusMsg: string, thought?: string): string {
   return logMessage;
 }
 
+function buildSessionButtonId(
+  action: 'approve' | 'reject',
+  projectName: string,
+  sessionId: string,
+): string {
+  return `${action}:${encodeURIComponent(projectName)}:${sessionId}`;
+}
+
+function parseButtonContext(customId: string): {
+  action: string;
+  projectName?: string;
+  sessionId?: string;
+} {
+  if (customId === 'cancel_task') {
+    return {
+      action: 'cancel',
+      sessionId: 'task',
+    };
+  }
+
+  if (customId.includes(':')) {
+    const [action, encodedProjectName, sessionId] = customId.split(':');
+
+    return {
+      action,
+      projectName: encodedProjectName ? decodeURIComponent(encodedProjectName) : undefined,
+      sessionId,
+    };
+  }
+
+  const [action, sessionId] = customId.split('_');
+  return { action, sessionId };
+}
+
+async function cleanupLostSession(
+  interaction: ButtonInteraction,
+  runtime: RuntimeState,
+  projectName?: string,
+): Promise<void> {
+  const project = projectName ? getProjectByName(projectName) : runtime.getActiveProject();
+
+  await rejectSession(project).catch(() => {});
+
+  await interaction.update({
+    content:
+      `⚠️ No pude encontrar el contexto de esta sesión.\n` +
+      `🧹 Limpié el workspace de \`${project.name}\` para destrabarte. Ya puedes empezar otra solicitud.`,
+    components: [],
+    files: [],
+  });
+}
+
 export function registerDiscordHandlers(client: Client, runtime: RuntimeState): void {
   client.on('messageCreate', async (message: Message) => {
-    if (message.author.bot || (message.channel as any).name !== 'jarvis-dev') return;
+    if (message.author.bot) return;
+
+    const channelName = (message.channel as any).name;
+    if (![runtimeConfig.manualChannelName, runtimeConfig.autonomousChannelName].includes(channelName)) {
+      return;
+    }
+
+    if (channelName === runtimeConfig.autonomousChannelName) {
+      if (runtime.isProcessing()) {
+        const warningMsg = await message.reply(
+          '⏳ Unity Agent ya está ejecutando otro run. Espera a que termine o cancélalo.',
+        );
+        setTimeout(() => warningMsg.delete().catch(() => {}), 5000);
+        return;
+      }
+
+      const project = runtime.getActiveProject();
+      const abortController = runtime.startProcessing();
+      const cancelRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId('cancel_task')
+          .setLabel('🛑 Cancelar Run')
+          .setStyle(ButtonStyle.Secondary),
+      );
+
+      const replyMessage = await message.reply({
+        content: '🤖 Unity Agent received the request. Planning autonomous execution...',
+        components: [cancelRow],
+      });
+
+      const thread = await message.startThread({
+        name:
+          message.content.length > 20
+            ? `⚙️ Unity Agent - ${message.content.substring(0, 20)}...`
+            : `⚙️ Unity Agent - ${message.content}`,
+        autoArchiveDuration: 60,
+      });
+
+      try {
+        const result = await runAutonomousAgent({
+          project,
+          prompt: message.content,
+          channelName,
+          signal: abortController.signal,
+          onProgress: async (progressMessage) => {
+            await thread.send(progressMessage).catch(() => {});
+          },
+        });
+
+        const taskLines = result.tasks
+          .map((task) => `- ${task.status.toUpperCase()} ${task.title}${task.commitMessage ? ` -> ${task.commitMessage}` : ''}`)
+          .join('\n');
+
+        const finalContent = `✅ **Unity Agent Run Complete**\n🆔 Run: \`${result.runId}\`\n🌿 Branch: \`${result.branchName}\`\n🔀 Merge target later: \`${result.defaultBranch}\`\n🧱 Commits created: \`${result.commitsCreated}\`\n🏠 Local: ${result.runtimeUrls.localUrl || 'Unavailable'}\n📱 Public: ${result.runtimeUrls.publicUrl || 'Unavailable'}\n\n${result.summary}`;
+
+        await replyMessage.edit({
+          content: finalContent,
+          components: [],
+        });
+
+        if (taskLines) {
+          await thread.send(`**Task Results**\n${taskLines}`);
+        }
+
+        await thread.setArchived(true);
+      } catch (error: any) {
+        if (error.message === 'AbortError' || error.name === 'AbortError') {
+          await replyMessage.edit({
+            content: '🛑 **Unity Agent Run Cancelled.**',
+            components: [],
+          });
+          await thread.send('🛑 Autonomous run cancelled by the user.');
+          await thread.setArchived(true);
+        } else {
+          console.error(error);
+          const safeError =
+            error.message.length > 1500 ? `${error.message.substring(0, 1500)}...` : error.message;
+          await thread.send(`❌ **AUTONOMOUS RUN ERROR:**\n\`\`\`bash\n${safeError}\n\`\`\``);
+          await replyMessage.edit({
+            content: '❌ Unity Agent encountered an error. Check the thread for logs.',
+            components: [],
+          });
+        }
+      } finally {
+        runtime.finishProcessing();
+      }
+
+      return;
+    }
 
     if (runtime.isProcessing()) {
       const warningMsg = await message.reply(
@@ -92,11 +238,11 @@ export function registerDiscordHandlers(client: Client, runtime: RuntimeState): 
 
       const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
-          .setCustomId(`approve_${result.sessionId}`)
+          .setCustomId(buildSessionButtonId('approve', project.name, result.sessionId))
           .setLabel('✅ Approve & PR')
           .setStyle(ButtonStyle.Success),
         new ButtonBuilder()
-          .setCustomId(`reject_${result.sessionId}`)
+          .setCustomId(buildSessionButtonId('reject', project.name, result.sessionId))
           .setLabel('🗑️ Revert (Start Over)')
           .setStyle(ButtonStyle.Danger),
       );
@@ -141,7 +287,7 @@ export function registerDiscordHandlers(client: Client, runtime: RuntimeState): 
 
   client.on('interactionCreate', async (interaction: Interaction) => {
     if (interaction.isButton()) {
-      const [action, sessionId] = interaction.customId.split('_');
+      const { action, projectName, sessionId } = parseButtonContext(interaction.customId);
 
       if (action === 'cancel' && sessionId === 'task') {
         if (runtime.abortCurrentTask()) {
@@ -166,13 +312,15 @@ export function registerDiscordHandlers(client: Client, runtime: RuntimeState): 
       runtime.startProcessing();
 
       try {
+        if (!sessionId) {
+          await cleanupLostSession(interaction, runtime, projectName);
+          return;
+        }
+
         const sessionRecord = runtime.getSessionRecord(sessionId);
 
         if (!sessionRecord) {
-          await interaction.reply({
-            content: '⚠️ No pude encontrar el contexto de esta sesión.',
-            ephemeral: true,
-          });
+          await cleanupLostSession(interaction, runtime, projectName);
           return;
         }
 
@@ -222,8 +370,30 @@ export function registerDiscordHandlers(client: Client, runtime: RuntimeState): 
       const { commandName } = interaction;
 
       if (commandName === 'status') {
+        const projectPolicy = getProjectPolicy(unityStore, runtime.getActiveProjectName());
         await interaction.reply(
-          `🤖 **Estado Actual:**\nJarvis está enfocado en el repositorio: \`${runtime.getActiveProjectName()}\`\nProcesando tarea: ${runtime.isProcessing() ? 'Sí 🔴' : 'No 🟢'}`,
+          `🤖 **Estado Actual:**\nJarvis está enfocado en el repositorio: \`${runtime.getActiveProjectName()}\`\nProcesando tarea: ${runtime.isProcessing() ? 'Sí 🔴' : 'No 🟢'}\nCanal manual: \`#${runtimeConfig.manualChannelName}\`\nCanal autónomo: \`#${runtimeConfig.autonomousChannelName}\`\nBranch autónoma: \`${projectPolicy.integrationBranchName}\`\nParalelismo: \`${projectPolicy.maxParallelTasks}\` | Retries: \`${projectPolicy.maxRetriesPerTask}\` | Horas: \`${projectPolicy.maxHours}\` | Commits: \`${projectPolicy.maxCommits}\``,
+        );
+        return;
+      }
+
+      if (commandName === 'policy') {
+        const projectName = runtime.getActiveProjectName();
+        const currentPolicy = getProjectPolicy(unityStore, projectName);
+        const updatedPolicy = normalizePolicy({
+          ...currentPolicy,
+          maxHours: interaction.options.getInteger('hours') ?? currentPolicy.maxHours,
+          maxCommits: interaction.options.getInteger('commits') ?? currentPolicy.maxCommits,
+          maxParallelTasks: interaction.options.getInteger('parallel') ?? currentPolicy.maxParallelTasks,
+          maxRetriesPerTask: interaction.options.getInteger('retries') ?? currentPolicy.maxRetriesPerTask,
+          maxImprovementCycles:
+            interaction.options.getInteger('improvements') ?? currentPolicy.maxImprovementCycles,
+        });
+
+        unityStore.upsertPolicy(projectName, updatedPolicy);
+
+        await interaction.reply(
+          `⚙️ **Política actualizada para \`${projectName}\`**\nBranch: \`${updatedPolicy.integrationBranchName}\`\nHoras: \`${updatedPolicy.maxHours}\`\nCommits: \`${updatedPolicy.maxCommits}\`\nParalelismo: \`${updatedPolicy.maxParallelTasks}\`\nRetries: \`${updatedPolicy.maxRetriesPerTask}\`\nSelf-improvement cycles: \`${updatedPolicy.maxImprovementCycles}\``,
         );
         return;
       }

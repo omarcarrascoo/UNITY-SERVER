@@ -14,6 +14,44 @@ interface WorkspaceTargets {
   packageDirs: string[];
 }
 
+function pathExistsNoFollow(targetPath: string): boolean {
+  try {
+    fs.lstatSync(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasValidNodeModules(packageDir: string): boolean {
+  const nodeModulesPath = path.join(packageDir, 'node_modules');
+
+  try {
+    const stat = fs.lstatSync(nodeModulesPath);
+
+    if (stat.isSymbolicLink()) {
+      const resolved = fs.realpathSync(nodeModulesPath);
+      return fs.statSync(resolved).isDirectory();
+    }
+
+    return stat.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function removeInvalidNodeModulesIfNeeded(packageDir: string): void {
+  const nodeModulesPath = path.join(packageDir, 'node_modules');
+
+  if (!pathExistsNoFollow(nodeModulesPath)) {
+    return;
+  }
+
+  if (!hasValidNodeModules(packageDir)) {
+    fs.rmSync(nodeModulesPath, { recursive: true, force: true });
+  }
+}
+
 function getBaseBranch(): string {
   return getRuntimeConfig().githubBaseBranch;
 }
@@ -76,6 +114,7 @@ function scanWorkspaceTargets(basePath: string): WorkspaceTargets {
 
 async function installWorkspaceDependencies(basePath: string, targets: WorkspaceTargets): Promise<void> {
   if (targets.packageDirs.length === 0 && fs.existsSync(path.join(basePath, 'package.json'))) {
+    removeInvalidNodeModulesIfNeeded(basePath);
     console.log(`⚙️ Single Repo detected. Installing Root Dependencies...`);
     await execPromise(`npm install`, { cwd: basePath });
     return;
@@ -84,6 +123,7 @@ async function installWorkspaceDependencies(basePath: string, targets: Workspace
   console.log(`⚙️ Monorepo detected. Scanning modules...`);
 
   for (const packageDir of targets.packageDirs) {
+    removeInvalidNodeModulesIfNeeded(packageDir);
     console.log(`⚙️ Installing module: ${path.basename(packageDir)}...`);
     await execPromise(`npm install`, { cwd: packageDir });
   }
@@ -100,6 +140,7 @@ export async function resolveWorkspace(project: WorkspaceProject): Promise<Prepa
     ...project,
     expoPath: targets.expoPath,
     apiPath: targets.apiPath,
+    packageDirs: targets.packageDirs,
   };
 }
 
@@ -114,6 +155,7 @@ export async function prepareWorkspace(project: WorkspaceProject): Promise<Prepa
   } else {
     console.log(`🔄 Resetting and updating ${project.name} for a fresh start...`);
     await resetWorkspace(project);
+    await execPromise(`git remote set-url origin "${getRepoUrl(project)}"`, { cwd: project.repoPath }).catch(() => {});
     await execPromise(`git checkout ${getBaseBranch()}`, { cwd: project.repoPath });
     await execPromise(`git pull origin ${getBaseBranch()}`, { cwd: project.repoPath });
   }
@@ -125,6 +167,7 @@ export async function prepareWorkspace(project: WorkspaceProject): Promise<Prepa
     ...project,
     expoPath: targets.expoPath,
     apiPath: targets.apiPath,
+    packageDirs: targets.packageDirs,
   };
 }
 
@@ -161,6 +204,7 @@ export async function createPullRequest(
   const config = getRuntimeConfig();
 
   try {
+    await execPromise(`git remote set-url origin "${getRepoUrl(workspace)}"`, { cwd: workspace.repoPath }).catch(() => {});
     await execPromise(`git checkout -b ${branchName}`, { cwd: workspace.repoPath });
     await execPromise(`git add .`, { cwd: workspace.repoPath });
     await execPromise(`git commit -m "${safeCommitMsg}"`, { cwd: workspace.repoPath });

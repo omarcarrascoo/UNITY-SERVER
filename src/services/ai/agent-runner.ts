@@ -1,6 +1,6 @@
 import { createAgentToolRuntime } from '../../tools.js';
 import { buildSystemPrompt } from './prompt-builder.js';
-import { applyEditsToFiles, extractJsonObject, getDirsToCheck } from './edit-operations.js';
+import { applyEditsToFiles, getDirsToCheck, parseJsonObject } from './edit-operations.js';
 import {
   getCurrentGitDiff,
   getNewCompilationErrors,
@@ -60,7 +60,7 @@ export async function generateAndWriteCode({
 
     const response = await client.chat.completions.create(
       {
-        model: 'deepseek-chat',
+        model: 'deepseek-reasoner',
         messages,
         tools: toolRuntime.tools as any,
         temperature: 0.1,
@@ -157,7 +157,7 @@ Do not expand the scope unless a concrete blocker remains.`,
     }
 
     try {
-      finalResult = JSON.parse(extractJsonObject(message.content || '')) as AIResponse;
+      finalResult = parseJsonObject<AIResponse>(message.content || '');
 
       if (agentThought && onStatusUpdate) {
         onStatusUpdate('🧪 Validating syntax and compilation...', agentThought);
@@ -301,4 +301,3 @@ Re-check that your JSON accurately matches the code changes you made and return 
     tokenUsage: totalTokens,
   };
 }
-

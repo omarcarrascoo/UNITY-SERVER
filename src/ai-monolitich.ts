@@ -66,7 +66,7 @@ export async function generateAndWriteCode(
     } else {
         // OpenAI-compatible providers share a common request shape via baseURL + modelName.
         let baseURL = '', apiKey = '', modelName = '';
-        if (provider === 'deepseek') { baseURL = 'https://api.deepseek.com'; apiKey = process.env.DEEPSEEK_API_KEY as string; modelName = 'deepseek-chat'; } 
+        if (provider === 'deepseek') { baseURL = 'https://api.deepseek.com'; apiKey = process.env.DEEPSEEK_API_KEY as string; modelName = 'deepseek-reasoner'; } 
         else if (provider === 'groq') { baseURL = 'https://api.groq.com/openai/v1'; apiKey = process.env.GROQ_API_KEY as string; modelName = 'llama-3.3-70b-versatile'; } 
         else if (provider === 'openrouter') { baseURL = 'https://openrouter.ai/api/v1'; apiKey = process.env.OPENROUTER_API_KEY as string; modelName = 'qwen/qwen-2.5-coder-32b-instruct:free'; }
 

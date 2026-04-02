@@ -7,6 +7,7 @@ export interface WorkspaceProject {
 export interface PreparedWorkspace extends WorkspaceProject {
   expoPath: string;
   apiPath: string | null;
+  packageDirs: string[];
 }
 
 export interface ProjectContextSnapshot {
@@ -30,4 +31,3 @@ export interface CompletedTaskArtifacts extends TaskExecutionResult {
   warning?: string;
   diffPath: string | null;
 }
-
