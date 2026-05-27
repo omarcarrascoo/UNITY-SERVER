@@ -45,6 +45,47 @@ function isRetryableNetworkError(error: any): boolean {
   return false;
 }
 
+function dumpPayloadOn400(
+  request: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
+  error: any,
+): void {
+  if (process.env.DEEPSEEK_DEBUG !== '1') return;
+  const status = Number(error?.status || error?.cause?.status || 0);
+  if (status !== 400) return;
+
+  const messages: any[] = Array.isArray(request.messages) ? (request.messages as any[]) : [];
+  const lastAssistantWithToolCalls = [...messages]
+    .reverse()
+    .find((m) => m?.role === 'assistant' && Array.isArray(m?.tool_calls) && m.tool_calls.length > 0);
+
+  const summary = lastAssistantWithToolCalls
+    ? {
+        index: messages.indexOf(lastAssistantWithToolCalls),
+        hasReasoningContent: typeof lastAssistantWithToolCalls.reasoning_content === 'string',
+        reasoningContentLen:
+          typeof lastAssistantWithToolCalls.reasoning_content === 'string'
+            ? lastAssistantWithToolCalls.reasoning_content.length
+            : null,
+        contentLen:
+          typeof lastAssistantWithToolCalls.content === 'string'
+            ? lastAssistantWithToolCalls.content.length
+            : null,
+        toolCallCount: lastAssistantWithToolCalls.tool_calls.length,
+        toolCallNames: lastAssistantWithToolCalls.tool_calls.map((tc: any) => tc?.function?.name),
+      }
+    : null;
+
+  console.error('[deepseek-debug] 400 from DeepSeek. Error body:', error?.error || error?.message || String(error));
+  console.error(
+    '[deepseek-debug] last assistant-with-tool_calls summary:',
+    JSON.stringify(summary, null, 2),
+  );
+  console.error(
+    '[deepseek-debug] message roles in payload:',
+    messages.map((m, i) => `${i}:${m?.role}${m?.tool_calls ? '(+tc)' : ''}`).join(' '),
+  );
+}
+
 export async function createDeepseekChatCompletion(
   request: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
   options?: Parameters<OpenAI['chat']['completions']['create']>[1],
@@ -59,6 +100,7 @@ export async function createDeepseekChatCompletion(
       const shouldRetry = !aborted && isRetryableNetworkError(error) && attempt < DEFAULT_MAX_NETWORK_RETRIES;
 
       if (!shouldRetry) {
+        dumpPayloadOn400(request, error);
         throw error;
       }
 

@@ -1,11 +1,15 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { execSync } from 'node:child_process';
-import { getRuntimeConfig, WORKSPACE_DIR } from '../../config.js';
+import { getRuntimeConfig, WORKSPACE_DIR, getProjectByName } from '../../config.js';
 import {
   approveAutonomousRunPlan,
+  createAutonomousRunPlan,
   rejectAutonomousRunPlan,
   resumeAutonomousRun,
 } from '../../application/run-autonomous-agent.js';
+import { runDevelopmentTask } from '../../application/run-development-task.js';
 import { RuntimeState } from '../../runtime/state.js';
 import { unityStore } from '../../runtime/services.js';
 import { createEntityId } from '../../shared/ids.js';
@@ -504,6 +508,61 @@ function buildRunPayload(runId: string) {
   };
 }
 
+/**
+ * In-memory ledger of pair-mode sessions. Pair runs do not persist to UnityStore
+ * (they're legacy one-shot iterations), so we keep a lightweight record here so
+ * the panel can at least show that they happened.
+ */
+interface PairSessionRecord {
+  sessionId: string;
+  projectName: string;
+  prompt: string;
+  status: 'running' | 'succeeded' | 'failed';
+  startedAt: string;
+  finishedAt: string | null;
+  commitMessage: string | null;
+  error: string | null;
+}
+const pairSessions: PairSessionRecord[] = [];
+const MAX_PAIR_SESSIONS = 50;
+
+function recordPairSession(sessionId: string, projectName: string, prompt: string): PairSessionRecord {
+  const record: PairSessionRecord = {
+    sessionId,
+    projectName,
+    prompt,
+    status: 'running',
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    commitMessage: null,
+    error: null,
+  };
+  pairSessions.unshift(record);
+  if (pairSessions.length > MAX_PAIR_SESSIONS) pairSessions.length = MAX_PAIR_SESSIONS;
+  return record;
+}
+
+function listAvailableProjects(): Array<{ name: string; repoPath: string; hasGit: boolean }> {
+  try {
+    if (!fs.existsSync(WORKSPACE_DIR)) return [];
+    const entries = fs.readdirSync(WORKSPACE_DIR, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+      .map((entry) => {
+        const repoPath = path.join(WORKSPACE_DIR, entry.name);
+        return {
+          name: entry.name,
+          repoPath,
+          hasGit: fs.existsSync(path.join(repoPath, '.git')),
+        };
+      })
+      .filter((p) => p.hasGit)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch {
+    return [];
+  }
+}
+
 function buildRunsListPayload() {
   return unityStore.listRuns(100).map((run) => {
     const latestPlan = unityStore.getLatestPlanByRun(run.id);
@@ -939,6 +998,51 @@ function buildHomePageShell(): string {
 
         <div class="stats-grid" id="hero-metrics"></div>
 
+        <h2 class="section-title">Launch New Run</h2>
+        <div id="launch-panel" style="background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius); padding:20px; margin-bottom:32px;">
+          <div style="display:flex; gap:12px; margin-bottom:16px; flex-wrap:wrap; align-items:stretch;">
+            <select id="launch-project" style="flex:1; min-width:200px; background:var(--bg-app); border:1px solid var(--border); color:var(--text-main); padding:10px 14px; border-radius:8px; font-size:13px; outline:none;">
+              <option value="">Loading projects...</option>
+            </select>
+          </div>
+          <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:10px; margin-bottom:16px;">
+            <button type="button" class="launch-mode-btn active" data-mode="interactive" style="background:var(--bg-app); border:1px solid #60a5fa80; border-radius:8px; padding:14px 16px; text-align:left; cursor:pointer; display:flex; flex-direction:column; gap:6px;">
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span class="mode-indicator" style="width:6px; height:6px; border-radius:50%; background:#60a5fa;"></span>
+                <span class="mode-title" style="font-size:13px; font-weight:600; color:#60a5fa; letter-spacing:0.01em;">Interactive Autonomous</span>
+              </div>
+              <div style="font-size:11px; color:var(--text-muted); line-height:1.5;">Plans a run and pauses for your approval before executing. Best for unfamiliar work.</div>
+            </button>
+            <button type="button" class="launch-mode-btn" data-mode="nightly" style="background:var(--bg-app); border:1px solid var(--border); border-radius:8px; padding:14px 16px; text-align:left; cursor:pointer; display:flex; flex-direction:column; gap:6px;">
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span class="mode-indicator" style="width:6px; height:6px; border-radius:50%; background:var(--text-muted);"></span>
+                <span class="mode-title" style="font-size:13px; font-weight:600; color:var(--text-muted); letter-spacing:0.01em;">Nightly Autonomous</span>
+              </div>
+              <div style="font-size:11px; color:var(--text-muted); line-height:1.5;">Auto-approves the plan and runs end-to-end. Best for well-scoped batched work.</div>
+            </button>
+            <button type="button" class="launch-mode-btn" data-mode="pair" style="background:var(--bg-app); border:1px solid var(--border); border-radius:8px; padding:14px 16px; text-align:left; cursor:pointer; display:flex; flex-direction:column; gap:6px;">
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span class="mode-indicator" style="width:6px; height:6px; border-radius:50%; background:var(--text-muted);"></span>
+                <span class="mode-title" style="font-size:13px; font-weight:600; color:var(--text-muted); letter-spacing:0.01em;">Pair</span>
+              </div>
+              <div style="font-size:11px; color:var(--text-muted); line-height:1.5;">Single iteration, no planner. Produces a diff and snapshot for quick back-and-forth.</div>
+            </button>
+          </div>
+          <div style="position:relative;">
+            <textarea id="launch-prompt" placeholder="Describe the change you want. Press Cmd/Ctrl+Enter to launch." style="width:100%; min-height:96px; max-height:280px; background:var(--bg-app); border:1px solid var(--border); color:var(--text-main); padding:12px 14px 28px; border-radius:8px; font-size:13px; line-height:1.6; outline:none; font-family:inherit; resize:none; overflow-y:auto; box-sizing:border-box;"></textarea>
+            <div id="launch-charcount" style="position:absolute; bottom:8px; right:12px; font-size:11px; color:var(--text-muted); pointer-events:none; font-variant-numeric:tabular-nums;">0</div>
+          </div>
+          <div id="launch-recent" style="display:none; margin-top:10px; gap:6px; flex-wrap:wrap;"></div>
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-top:12px;">
+            <div id="launch-hint" style="font-size:12px; color:var(--text-muted); flex:1; min-width:0;">Discord remains active for mobile use — the panel is an additional interface.</div>
+            <button type="button" id="launch-submit" style="background:var(--text-main); color:var(--bg-app); border:none; border-radius:8px; padding:10px 20px; font-size:13px; font-weight:600; cursor:pointer; white-space:nowrap; display:inline-flex; align-items:center; gap:8px; transition:opacity 0.15s;">
+              <span id="launch-submit-label">Launch Run</span>
+              <span id="launch-submit-kbd" style="font-size:10px; padding:2px 6px; border-radius:4px; background:rgba(0,0,0,0.15); opacity:0.7; font-weight:500;">⌘↵</span>
+            </button>
+          </div>
+          <div id="launch-status" style="margin-top:12px; font-size:12px; display:none;"></div>
+        </div>
+
         <h2 class="section-title">System Health</h2>
         <div class="health-grid" id="health-grid"></div>
 
@@ -954,6 +1058,14 @@ function buildHomePageShell(): string {
         <table class="runs-table" id="runs-table">
           <thead>
             <tr><th>Project</th><th>Status</th><th>Tasks</th><th>Progress</th><th>Mode</th><th>Created</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+
+        <h2 class="section-title" style="margin-top:32px;">Pair Sessions</h2>
+        <table class="runs-table" id="pair-table">
+          <thead>
+            <tr><th>Session</th><th>Project</th><th>Prompt</th><th>Status</th><th>Started</th></tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -983,6 +1095,17 @@ function buildHomePageShell(): string {
         ].map(function(m){return '<div class="stat-card"><div class="stat-label">'+m[0]+'</div><div class="stat-value" style="color:'+m[2]+'">'+m[1]+'</div></div>';}).join('');
       }
 
+      var MODE_META = {
+        interactive: {color:'#60a5fa', label:'Interactive'},
+        nightly: {color:'#a78bfa', label:'Nightly'},
+        pair: {color:'#4ade80', label:'Pair'},
+        auto: {color:'#d1d5db', label:'Auto'}
+      };
+      function modeBadge(mode){
+        var m=MODE_META[mode]||{color:'#d1d5db',label:mode};
+        return '<span style="display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:99px;background:'+m.color+'15;color:'+m.color+';border:1px solid '+m.color+'30;font-size:11px;font-weight:500;"><span style="width:5px;height:5px;border-radius:50%;background:'+m.color+';"></span>'+safe(m.label)+'</span>';
+      }
+
       function renderRunsTable(items){
         var tbody=document.querySelector('#runs-table tbody');
         if(!items.length){tbody.innerHTML='<tr><td colspan="6" class="muted" style="text-align:center;padding:24px;">No runs yet.</td></tr>';return;}
@@ -993,7 +1116,7 @@ function buildHomePageShell(): string {
             +'<td>'+badge(r.status)+'</td>'
             +'<td>'+safe((tc.succeeded||0)+'/'+(tc.total||0))+'</td>'
             +'<td>'+bar(tc.progress||0)+'<span style="font-size:11px;margin-left:6px;color:var(--text-muted)">'+(tc.progress||0)+'%</span></td>'
-            +'<td style="color:var(--text-muted)">'+safe(r.mode)+'</td>'
+            +'<td>'+modeBadge(r.mode)+'</td>'
             +'<td style="color:var(--text-muted);font-size:12px">'+ago(r.createdAt)+'</td>'
             +'</tr>';
         }).join('');
@@ -1041,10 +1164,211 @@ function buildHomePageShell(): string {
         renderRunsTable(filterRuns(allRuns));
       }
 
+      function renderPairSessions(sessions){
+        var tbody=document.querySelector('#pair-table tbody');
+        if(!sessions.length){tbody.innerHTML='<tr><td colspan="5" class="muted" style="text-align:center;padding:20px;">No pair sessions yet. Use the launcher above with Pair mode selected.</td></tr>';return;}
+        var STATUS_COLORS={running:'#60a5fa', succeeded:'#4ade80', failed:'#f87171'};
+        tbody.innerHTML=sessions.map(function(s){
+          var c=STATUS_COLORS[s.status]||'#d1d5db';
+          return '<tr>'
+            +'<td style="font-family:ui-monospace,monospace;font-size:11px;color:var(--text-muted);">'+safe(s.sessionId.slice(0,20))+'</td>'
+            +'<td style="font-weight:500">'+safe(s.projectName)+'</td>'
+            +'<td style="color:var(--text-muted);font-size:12px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+safe(s.prompt)+'">'+safe(s.prompt)+'</td>'
+            +'<td><span style="padding:3px 8px;border-radius:99px;background:'+c+'15;color:'+c+';border:1px solid '+c+'30;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;">'+safe(s.status)+'</span></td>'
+            +'<td style="color:var(--text-muted);font-size:12px">'+ago(s.startedAt)+'</td>'
+            +'</tr>';
+        }).join('');
+      }
+
+      async function loadPairSessions(){
+        try{var r=await fetch('/api/pair-sessions');renderPairSessions(await r.json());}catch(e){console.error(e);}
+      }
+
+      // ── Launch panel (interactive autonomous + nightly autonomous + pair) ──
+      let launchMode = 'interactive';
+      const LAUNCH_HINTS = {
+        interactive: 'Jarvis will plan the work and wait for your approval before executing. You can review the tasks first.',
+        nightly: 'Jarvis will plan AND execute without asking. Good for well-scoped work where you trust the outcome.',
+        pair: 'Single code iteration: one diff, one snapshot, no planner. Same behavior as the Discord #jarvis-dev channel.',
+      };
+      async function loadProjects(){
+        try {
+          var r = await fetch('/api/projects');
+          var projects = await r.json();
+          var sel = document.getElementById('launch-project');
+          if (!projects.length) {
+            sel.innerHTML = '<option value="">No projects found in workspaces/</option>';
+            return;
+          }
+          sel.innerHTML = projects.map(function(p){return '<option value="'+safe(p.name)+'">'+safe(p.name)+'</option>';}).join('');
+        } catch(e) {
+          console.error('Failed to load projects', e);
+        }
+      }
+
+      const MODE_COLORS = { interactive: '#60a5fa', nightly: '#a78bfa', pair: '#4ade80' };
+      function setLaunchMode(mode){
+        launchMode = mode;
+        var accent = MODE_COLORS[mode] || '#60a5fa';
+        document.querySelectorAll('.launch-mode-btn').forEach(function(b){
+          var active = b.dataset.mode === mode;
+          b.classList.toggle('active', active);
+          var btnAccent = MODE_COLORS[b.dataset.mode] || '#60a5fa';
+          b.style.borderColor = active ? (btnAccent + '80') : 'var(--border)';
+          var indicator = b.querySelector('.mode-indicator');
+          var title = b.querySelector('.mode-title');
+          if (indicator) indicator.style.background = active ? btnAccent : 'var(--text-muted)';
+          if (title) title.style.color = active ? btnAccent : 'var(--text-muted)';
+        });
+        document.getElementById('launch-hint').textContent = LAUNCH_HINTS[mode] || '';
+      }
+
+      document.querySelectorAll('.launch-mode-btn').forEach(function(btn){
+        btn.addEventListener('click', function(){ setLaunchMode(btn.dataset.mode); });
+      });
+
+      // ── Launch: textarea UX (auto-resize, char count, Cmd+Enter, prompt history) ──
+      var promptEl = document.getElementById('launch-prompt');
+      var charEl = document.getElementById('launch-charcount');
+      var submitBtn = document.getElementById('launch-submit');
+      var submitLabel = document.getElementById('launch-submit-label');
+      var submitKbd = document.getElementById('launch-submit-kbd');
+      var recentEl = document.getElementById('launch-recent');
+
+      function autoResize(){
+        promptEl.style.height = 'auto';
+        promptEl.style.height = Math.min(promptEl.scrollHeight, 280) + 'px';
+      }
+      function updateCharCount(){
+        var n = promptEl.value.length;
+        charEl.textContent = n === 0 ? '0' : n.toLocaleString();
+        charEl.style.color = n > 2000 ? '#f59e0b' : 'var(--text-muted)';
+      }
+
+      // Keyboard hint: use ⌘↵ on Mac, Ctrl+↵ elsewhere. If no OS detection, keep generic.
+      if (navigator.platform && navigator.platform.indexOf('Mac') === -1) {
+        submitKbd.textContent = 'Ctrl+↵';
+      }
+
+      // Load up to 5 recent prompts from localStorage for quick reuse.
+      var RECENT_KEY = 'unity.launch.recent';
+      function loadRecent(){
+        try { return JSON.parse(localStorage.getItem(RECENT_KEY) || '[]'); } catch(e){ return []; }
+      }
+      function saveRecent(entry){
+        var list = loadRecent();
+        list = list.filter(function(e){ return e.prompt !== entry.prompt; });
+        list.unshift(entry);
+        list = list.slice(0, 5);
+        try { localStorage.setItem(RECENT_KEY, JSON.stringify(list)); } catch(e){}
+        renderRecent();
+      }
+      function renderRecent(){
+        var list = loadRecent();
+        if (!list.length) { recentEl.style.display = 'none'; return; }
+        recentEl.style.display = 'flex';
+        recentEl.innerHTML = '<span style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em;font-weight:600;align-self:center;margin-right:4px;">Recent</span>' +
+          list.map(function(e, i){
+            var truncated = e.prompt.length > 50 ? e.prompt.slice(0, 50) + '…' : e.prompt;
+            return '<button type="button" class="recent-prompt" data-idx="'+i+'" style="background:var(--bg-app);border:1px solid var(--border);color:var(--text-muted);padding:4px 10px;border-radius:99px;font-size:11px;cursor:pointer;font-family:inherit;" title="'+safe(e.prompt)+'">'+safe(truncated)+'</button>';
+          }).join('');
+        document.querySelectorAll('.recent-prompt').forEach(function(btn){
+          btn.onclick = function(){
+            var entry = list[parseInt(btn.dataset.idx, 10)];
+            if (!entry) return;
+            promptEl.value = entry.prompt;
+            if (entry.projectName) {
+              var sel = document.getElementById('launch-project');
+              if (Array.from(sel.options).some(function(o){ return o.value === entry.projectName; })) {
+                sel.value = entry.projectName;
+              }
+            }
+            if (entry.mode) setLaunchMode(entry.mode);
+            autoResize();
+            updateCharCount();
+            promptEl.focus();
+          };
+        });
+      }
+
+      async function doLaunch(){
+        if (submitBtn.disabled) return;
+        var projectName = document.getElementById('launch-project').value;
+        var prompt = promptEl.value.trim();
+        var statusEl = document.getElementById('launch-status');
+
+        if (!projectName || !prompt) {
+          statusEl.style.display = 'block';
+          statusEl.style.color = '#f87171';
+          statusEl.textContent = 'Select a project and write a prompt before launching.';
+          promptEl.focus();
+          return;
+        }
+
+        submitBtn.disabled = true;
+        submitBtn.style.opacity = '0.7';
+        submitLabel.textContent = 'Launching';
+        submitKbd.style.display = 'none';
+        statusEl.style.display = 'block';
+        statusEl.style.color = 'var(--text-muted)';
+        statusEl.textContent = 'Creating run on ' + projectName + '...';
+
+        try {
+          var endpoint = launchMode === 'pair' ? '/api/pair-sessions' : '/api/runs';
+          var body = { projectName: projectName, prompt: prompt };
+          if (launchMode !== 'pair') body.mode = launchMode; // interactive or nightly
+          var resp = await fetch(endpoint, {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(body),
+          });
+          var data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || 'Request failed');
+
+          saveRecent({ prompt: prompt, projectName: projectName, mode: launchMode });
+
+          if (launchMode !== 'pair' && data.runId) {
+            statusEl.style.color = '#4ade80';
+            statusEl.textContent = 'Run created. Redirecting to run page...';
+            setTimeout(function(){ location.href = '/runs/' + encodeURIComponent(data.runId); }, 500);
+          } else {
+            statusEl.style.color = '#4ade80';
+            statusEl.textContent = 'Pair session started (' + safe(data.sessionId) + '). Progress appears in the Pair Sessions table below and in the console logs.';
+            promptEl.value = '';
+            autoResize();
+            updateCharCount();
+            loadPairSessions();
+          }
+        } catch (err) {
+          statusEl.style.color = '#f87171';
+          statusEl.textContent = 'Failed: ' + (err.message || err);
+        } finally {
+          submitBtn.disabled = false;
+          submitBtn.style.opacity = '1';
+          submitLabel.textContent = 'Launch Run';
+          submitKbd.style.display = 'inline-block';
+        }
+      }
+
+      submitBtn.addEventListener('click', doLaunch);
+      promptEl.addEventListener('input', function(){ autoResize(); updateCharCount(); });
+      promptEl.addEventListener('keydown', function(e){
+        if ((e.metaKey || e.ctrlKey) && (e.key === 'Enter' || e.keyCode === 13)) {
+          e.preventDefault();
+          doLaunch();
+        }
+      });
+
+      setLaunchMode('interactive');
+      renderRecent();
+
       document.getElementById('runs-search').addEventListener('input',function(){renderSidebar(filterRuns(allRuns));renderRunsTable(filterRuns(allRuns));});
       loadRuns();
       renderHealth();
+      loadProjects();
+      loadPairSessions();
       setInterval(loadRuns,5000);
+      setInterval(loadPairSessions,5000);
     </script>
   </body>
 </html>`;
@@ -1231,6 +1555,7 @@ function renderRunPage(
           </div>
         </div>
         <div id="meta-grid" class="meta-grid">${metaHtml}</div>
+        <div id="mode-banner" style="display:none; align-items:center; gap:10px; padding:10px 14px; border:1px solid var(--border); border-radius:8px; background:var(--bg-surface); flex-wrap:wrap;"></div>
       </header>
 
       <div class="dashboard-layout">
@@ -1301,7 +1626,7 @@ function renderRunPage(
       <div class="diff-modal">
         <div class="diff-modal-header">
           <h3 id="diff-title">Diff</h3>
-          <button class="btn-secondary" id="diff-close" type="button" style="padding:6px 12px;">✕ Close</button>
+          <button class="btn-secondary" id="diff-close" type="button" style="padding:6px 12px;">Close</button>
         </div>
         <div class="diff-modal-body"><pre id="diff-content">Loading...</pre></div>
       </div>
@@ -1399,6 +1724,17 @@ function renderRunPage(
         }
       }
 
+      const MODE_META = {
+        interactive: { label: 'Interactive Autonomous', color: '#60a5fa', desc: 'Planner proposes tasks; you approve before execution.' },
+        nightly: { label: 'Nightly Autonomous', color: '#a78bfa', desc: 'Planner and executor run end-to-end without approval gates.' },
+        pair: { label: 'Pair', color: '#4ade80', desc: 'Single iteration, no planner.' },
+        auto: { label: 'Auto', color: '#e4e4e7', desc: 'Legacy mode.' }
+      };
+      function modeBadge(mode){
+        const m = MODE_META[mode] || { label: mode, color: '#d1d5db', desc: '' };
+        return \`<span class="status-badge" title="\${safe(m.desc)}" style="background:\${m.color}15;color:\${m.color};border:1px solid \${m.color}40;display:inline-flex;align-items:center;gap:6px;"><span style="width:5px;height:5px;border-radius:50%;background:\${m.color};"></span>\${safe(m.label)}</span>\`;
+      }
+
       function updateTopbar(run, plan, counts) {
         document.getElementById('hero-title').textContent = run.projectName + ' · ' + run.id;
         document.getElementById('hero-summary').textContent = plan?.summary || run.summary || run.prompt;
@@ -1406,11 +1742,25 @@ function renderRunPage(
         document.getElementById('progress-bar').style.width = counts.progress + '%';
 
         const cards = [
-          ['Status', statusBadge(run.status)], ['Mode', safe(run.mode)], ['Branch', safe(run.branchName)],
+          ['Status', statusBadge(run.status)], ['Mode', modeBadge(run.mode)], ['Branch', safe(run.branchName)],
           ['Plan', plan ? statusBadge(plan.status) : '<span class="muted">Missing</span>'],
           ['Progress', counts.progress+'%'], ['Tasks', counts.total], ['Running', counts.running], ['Failed', counts.failed]
         ];
         document.getElementById('meta-grid').innerHTML = cards.map(c => \`<div class="meta-card"><div class="meta-label">\${c[0]}</div><div class="meta-value">\${c[1]}</div></div>\`).join('');
+
+        // Mode banner: only show explicit guidance for interactive (awaiting approval) and nightly (auto-approve warning).
+        const bannerEl = document.getElementById('mode-banner');
+        if (bannerEl) {
+          const m = MODE_META[run.mode];
+          if (m && run.status !== 'completed' && run.status !== 'completed_with_warnings' && run.status !== 'failed' && run.status !== 'cancelled') {
+            bannerEl.style.display = 'flex';
+            bannerEl.style.borderColor = m.color + '40';
+            bannerEl.style.background = m.color + '10';
+            bannerEl.innerHTML = '<span style="width:6px;height:6px;border-radius:50%;background:' + m.color + ';flex-shrink:0;"></span><span style="color:' + m.color + ';font-weight:500;font-size:13px;letter-spacing:0.01em;">' + safe(m.label) + '</span><span style="color:var(--text-muted);font-size:12px;">' + safe(m.desc) + '</span>';
+          } else {
+            bannerEl.style.display = 'none';
+          }
+        }
 
         const actions = document.getElementById('actions');
         let actHtml = '';
@@ -1552,8 +1902,21 @@ function renderRunPage(
           renderAll();
         }));
 
-        document.getElementById('events').innerHTML = events.length ? events.slice().reverse().map(e => {
-          const c = e.level==='error'?'#f87171':e.level==='warning'?'#facc15':'#60a5fa';
+        document.getElementById('events').innerHTML = events.length ? events.slice().reverse().map((e, idx) => {
+          const isThinking = e.type === 'agent.thinking';
+          const c = isThinking ? '#a78bfa' : e.level==='error'?'#f87171':e.level==='warning'?'#facc15':'#60a5fa';
+          const thinkingId = 'think-' + idx;
+          if (isThinking) {
+            const body = safe(e.message).replace(/\\n/g, '<br>');
+            return \`<div class="timeline-item"><div class="timeline-dot" style="background:\${c}; box-shadow:0 0 0 4px #09090b"></div>
+              <div class="event-card" style="border-color:#a78bfa30;">
+                <div class="event-top" style="cursor:pointer;" onclick="var el=document.getElementById('\${thinkingId}'); el.style.display=el.style.display==='block'?'none':'block'; this.querySelector('.thinking-caret').textContent=el.style.display==='block'?'Hide':'Show';">
+                  <strong style="font-size:12px;color:#a78bfa;text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Reasoning</strong>
+                  <span class="muted" style="font-size:11px">\${formatDate(e.createdAt)} · <span class="thinking-caret">Show</span></span>
+                </div>
+                <div id="\${thinkingId}" style="display:none; font-size:12px; margin-top:8px; color:var(--text-muted); max-height:360px; overflow-y:auto; padding:10px 12px; background:var(--bg-app); border-radius:6px; border:1px solid #2a2a2d; white-space:pre-wrap; font-family:ui-monospace, monospace; line-height:1.6;">\${body}</div>
+              </div></div>\`;
+          }
           return \`<div class="timeline-item"><div class="timeline-dot" style="background:\${c}; box-shadow:0 0 0 4px #09090b"></div>
             <div class="event-card"><div class="event-top"><strong style="font-size:13px">\${safe(e.type)}</strong><span class="muted" style="font-size:11px">\${formatDate(e.createdAt)}</span></div>
             <div style="font-size:13px; margin-top:6px; color:var(--text-muted)">\${safe(e.message)}</div></div></div>\`;
@@ -2008,48 +2371,116 @@ function buildSettingsPage(): string {
 function buildLearningPage(): string {
   return shellPage('Learning', '/learning', `
     <h1 class="page-title">Learning Patterns</h1>
-    <p class="page-subtitle">Patterns extracted from successful tasks. Higher effectiveness scores mean more reliable guidance for future runs.</p>
+    <p class="page-subtitle">Patterns extracted from successful tasks. Each row shows what worked and where. Click a pattern to inspect its approach, files, tools, and outcomes.</p>
 
     <div class="card-grid" id="learning-stats"></div>
 
+    <h2 class="section-title section-gap">Top Tags</h2>
+    <div id="tag-cloud" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:24px;"></div>
+
     <h2 class="section-title section-gap">Pattern Browser</h2>
-    <div style="display:flex;gap:12px;margin-bottom:16px;">
-      <input id="pat-search" type="text" placeholder="Search patterns..." style="flex:1;background:var(--bg-surface);border:1px solid var(--border);color:var(--text-main);padding:10px 14px;border-radius:8px;font-size:13px;outline:none;">
+    <div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;">
+      <input id="pat-search" type="text" placeholder="Search patterns, approach, file paths..." style="flex:1;min-width:260px;background:var(--bg-surface);border:1px solid var(--border);color:var(--text-main);padding:10px 14px;border-radius:8px;font-size:13px;outline:none;">
       <select id="pat-kind-filter" style="background:var(--bg-surface);border:1px solid var(--border);color:var(--text-main);padding:10px 14px;border-radius:8px;font-size:13px;outline:none;">
         <option value="all">All Kinds</option>
         <option value="implement">implement</option><option value="improve">improve</option>
         <option value="heal">heal</option><option value="review">review</option>
       </select>
+      <select id="pat-project-filter" style="background:var(--bg-surface);border:1px solid var(--border);color:var(--text-main);padding:10px 14px;border-radius:8px;font-size:13px;outline:none;">
+        <option value="all">All Projects</option>
+      </select>
+      <div id="tag-filter-chip" style="display:none;align-items:center;gap:8px;padding:8px 12px;background:#a78bfa15;border:1px solid #a78bfa50;border-radius:99px;font-size:12px;color:#a78bfa;cursor:pointer;" title="Click to clear tag filter">
+        <span id="tag-filter-label"></span>
+        <span style="opacity:0.7;font-size:14px;line-height:1;">×</span>
+      </div>
     </div>
     <div id="pattern-list"></div>
 
     <div id="pattern-detail" style="display:none;margin-top:24px;">
-      <h2 class="section-title">Pattern Detail</h2>
-      <div id="detail-content"></div>
-      <h3 style="font-size:14px;font-weight:500;margin:16px 0 8px;">Application Outcomes</h3>
-      <table id="outcome-table"><thead><tr><th>Task</th><th>Run</th><th>Result</th><th>Iterations</th><th>Date</th></tr></thead><tbody></tbody></table>
+      <div class="card" style="margin-bottom:16px;">
+        <div id="detail-header"></div>
+        <div id="detail-tabs" style="display:flex;gap:2px;margin:20px 0 0;border-bottom:1px solid var(--border);">
+          <button type="button" class="pat-tab active" data-tab="approach" style="background:transparent;border:none;color:var(--text-main);padding:10px 16px;font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid var(--text-main);">Approach</button>
+          <button type="button" class="pat-tab" data-tab="files" style="background:transparent;border:none;color:var(--text-muted);padding:10px 16px;font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent;">Files</button>
+          <button type="button" class="pat-tab" data-tab="tools" style="background:transparent;border:none;color:var(--text-muted);padding:10px 16px;font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent;">Tools</button>
+          <button type="button" class="pat-tab" data-tab="outcomes" style="background:transparent;border:none;color:var(--text-muted);padding:10px 16px;font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent;">Outcomes</button>
+        </div>
+        <div id="detail-body" style="padding-top:20px;"></div>
+      </div>
     </div>
   `, `
-    function safe(v){return String(v||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+    function safe(v){return String(v||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
     function bar(ratio,color){return '<div style="height:8px;background:var(--bg-app);border-radius:99px;overflow:hidden;width:80px;display:inline-block;vertical-align:middle;"><div style="height:100%;border-radius:99px;width:'+Math.max(0,Math.round(ratio*50+50))+'%;background:'+color+'"></div></div>';}
+    function effColor(s){return s>0.3?'#4ade80':s<-0.1?'#f87171':'#f59e0b';}
+    function ago(d){if(!d)return'—';var ms=Date.now()-new Date(d).getTime(),m=Math.round(ms/60000);if(m<1)return'just now';if(m<60)return m+'m ago';var h=Math.round(m/60);if(h<24)return h+'h ago';return Math.round(h/24)+'d ago';}
+
     var allPatterns=[];
     var selectedPatternId=null;
+    var selectedTab='approach';
+    var outcomeCache={};
+    var tagFilter=null;
 
-    function effColor(s){return s>0.3?'#4ade80':s<-0.1?'#f87171':'#f59e0b';}
+    function renderTagCloud(tags){
+      var max=Math.max.apply(null,tags.map(function(t){return t.patternCount;}).concat([1]));
+      document.getElementById('tag-cloud').innerHTML=tags.slice(0,30).map(function(t){
+        var ratio=t.patternCount/max;
+        var size=12+Math.round(ratio*6);
+        var c=effColor(t.avgEffectiveness);
+        var active=tagFilter===t.tag;
+        return '<span class="tag-pill" data-tag="'+safe(t.tag)+'" style="cursor:pointer;padding:4px 10px;border-radius:99px;background:'+(active?'#a78bfa25':'var(--bg-surface)')+';border:1px solid '+(active?'#a78bfa80':'var(--border)')+';font-size:'+size+'px;color:'+c+';font-weight:500;" title="'+t.patternCount+' pattern(s), '+t.totalApplications+' applications">'+safe(t.tag)+' <span style="color:var(--text-muted);font-size:11px;">·'+t.patternCount+'</span></span>';
+      }).join('');
+      document.querySelectorAll('.tag-pill').forEach(function(el){
+        el.onclick=function(){
+          tagFilter=tagFilter===el.dataset.tag?null:el.dataset.tag;
+          updateTagFilterChip();
+          renderTagCloud(tags);
+          renderPatterns();
+        };
+      });
+    }
+
+    function updateTagFilterChip(){
+      var chip=document.getElementById('tag-filter-chip');
+      if(tagFilter){
+        chip.style.display='inline-flex';
+        document.getElementById('tag-filter-label').textContent='tag: '+tagFilter;
+      }else{
+        chip.style.display='none';
+      }
+    }
+    document.getElementById('tag-filter-chip').onclick=function(){tagFilter=null;updateTagFilterChip();renderPatterns();};
 
     function renderPatterns(){
       var search=(document.getElementById('pat-search').value||'').toLowerCase();
       var kind=document.getElementById('pat-kind-filter').value;
+      var project=document.getElementById('pat-project-filter').value;
       var filtered=allPatterns.filter(function(p){
         if(kind!=='all'&&p.taskKind!==kind)return false;
-        if(search&&![p.taskKind,p.filePattern,p.approach,p.projectName].join(' ').toLowerCase().includes(search))return false;
+        if(project!=='all'&&p.projectName!==project)return false;
+        if(tagFilter&&!(p.tags||[]).includes(tagFilter))return false;
+        if(search){
+          var hay=[p.taskKind,p.filePattern,p.approach,p.projectName,(p.tags||[]).join(' '),(p.filesEdited||[]).join(' '),p.sourceTaskTitle||''].join(' ').toLowerCase();
+          if(!hay.includes(search))return false;
+        }
         return true;
       });
 
       document.getElementById('pattern-list').innerHTML=filtered.length?filtered.map(function(p){
         var c=effColor(p.effectivenessScore);
-        var active=selectedPatternId===p.id?' style="border-color:#71717a;background:linear-gradient(180deg,rgba(39,39,42,0.95),rgba(24,24,27,0.98));"':'';
-        return '<div class="card" data-pid="'+safe(p.id)+'"'+active+' style="margin-bottom:8px;cursor:pointer;transition:all 0.15s;'+(selectedPatternId===p.id?'border-color:#71717a;':'')+'"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:8px;"><div><span style="font-weight:500;font-size:14px;">'+safe(p.taskKind)+'</span><span style="font-family:monospace;font-size:12px;color:var(--text-muted);margin-left:12px;">'+safe(p.filePattern)+'</span></div><div style="display:flex;align-items:center;gap:8px;">'+bar(p.effectivenessScore,c)+'<span style="font-size:13px;font-weight:500;color:'+c+';min-width:40px;text-align:right;">'+(p.effectivenessScore*100).toFixed(0)+'%</span></div></div><div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;max-height:40px;overflow:hidden;">'+safe(p.approach?.slice(0,200))+'</div><div style="display:flex;gap:16px;font-size:12px;color:var(--text-muted);"><span>Applied: '+p.timesApplied+'</span><span style="color:#4ade80">Succeeded: '+p.timesSucceeded+'</span><span style="color:#f87171">Failed: '+p.timesFailed+'</span><span>Project: '+safe(p.projectName)+'</span></div></div>';
+        var active=selectedPatternId===p.id;
+        var tagsHtml=(p.tags||[]).slice(0,6).map(function(t){return '<span style="padding:2px 8px;border-radius:99px;background:var(--bg-app);border:1px solid var(--border);font-size:11px;color:var(--text-muted);">'+safe(t)+'</span>';}).join(' ');
+        var title=p.sourceTaskTitle||p.approach?.slice(0,80)||'(untitled pattern)';
+        return '<div class="card" data-pid="'+safe(p.id)+'" style="margin-bottom:8px;cursor:pointer;transition:all 0.15s;'+(active?'border-color:#71717a;background:linear-gradient(180deg,rgba(39,39,42,0.95),rgba(24,24,27,0.98));':'')+'">'
+          +'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:10px;">'
+          +'<div style="flex:1;min-width:0;">'
+          +'<div style="font-weight:500;font-size:14px;margin-bottom:4px;">'+safe(title)+'</div>'
+          +'<div style="display:flex;gap:10px;font-size:12px;color:var(--text-muted);flex-wrap:wrap;"><span>'+safe(p.taskKind)+'</span><span style="font-family:monospace;">'+safe(p.filePattern)+'</span><span>'+safe(p.projectName)+'</span></div>'
+          +'</div>'
+          +'<div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">'+bar(p.effectivenessScore,c)+'<span style="font-size:13px;font-weight:500;color:'+c+';min-width:42px;text-align:right;">'+(p.effectivenessScore*100).toFixed(0)+'%</span></div>'
+          +'</div>'
+          +(tagsHtml?'<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:10px;">'+tagsHtml+'</div>':'')
+          +'<div style="display:flex;gap:16px;font-size:12px;color:var(--text-muted);flex-wrap:wrap;"><span>Applied '+p.timesApplied+'</span><span style="color:#4ade80">Succeeded '+p.timesSucceeded+'</span><span style="color:#f87171">Failed '+p.timesFailed+'</span><span>'+ago(p.updatedAt||p.createdAt)+'</span></div>'
+          +'</div>';
       }).join(''):'<div class="muted" style="padding:24px;text-align:center;">No patterns match your filters.</div>';
 
       document.querySelectorAll('[data-pid]').forEach(function(el){
@@ -2057,57 +2488,114 @@ function buildLearningPage(): string {
       });
     }
 
+    function renderDetailBody(p){
+      if(selectedTab==='approach'){
+        var tagsHtml=(p.tags&&p.tags.length)?'<div style="margin-top:12px;display:flex;gap:6px;flex-wrap:wrap;"><span style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-right:6px;align-self:center;">Tags:</span>'+p.tags.map(function(t){return '<span style="padding:2px 8px;border-radius:99px;background:var(--bg-app);border:1px solid var(--border);font-size:11px;color:var(--text-muted);">'+safe(t)+'</span>';}).join('')+'</div>':'';
+        document.getElementById('detail-body').innerHTML='<pre style="background:var(--bg-app);padding:16px;border-radius:8px;border:1px solid var(--border);white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:13px;line-height:1.6;">'+safe(p.approach||'(no approach recorded)')+'</pre>'+tagsHtml;
+        return;
+      }
+      if(selectedTab==='files'){
+        var readHtml=(p.filesRead||[]).length?'<ul style="list-style:none;padding:0;margin:0;">'+p.filesRead.map(function(f){return '<li style="font-family:ui-monospace,monospace;font-size:12px;padding:6px 10px;background:var(--bg-app);border:1px solid var(--border);border-radius:6px;margin-bottom:4px;color:var(--text-muted);">'+safe(f)+'</li>';}).join('')+'</ul>':'<div class="muted">No files recorded.</div>';
+        var editHtml=(p.filesEdited||[]).length?'<ul style="list-style:none;padding:0;margin:0;">'+p.filesEdited.map(function(f){return '<li style="font-family:ui-monospace,monospace;font-size:12px;padding:6px 10px;background:#4ade8010;border:1px solid #4ade8030;border-radius:6px;margin-bottom:4px;">'+safe(f)+'</li>';}).join('')+'</ul>':'<div class="muted">No files edited.</div>';
+        document.getElementById('detail-body').innerHTML='<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;"><div><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:8px;">Files Read ('+(p.filesRead||[]).length+')</div>'+readHtml+'</div><div><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:8px;">Files Edited ('+(p.filesEdited||[]).length+')</div>'+editHtml+'</div></div>';
+        return;
+      }
+      if(selectedTab==='tools'){
+        var tools=p.topTools||[];
+        if(!tools.length){document.getElementById('detail-body').innerHTML='<div class="muted">No tool usage recorded for this pattern.</div>';return;}
+        document.getElementById('detail-body').innerHTML='<div style="display:flex;gap:8px;flex-wrap:wrap;">'+tools.map(function(t){return '<span style="padding:6px 12px;border-radius:8px;background:var(--bg-app);border:1px solid var(--border);font-family:ui-monospace,monospace;font-size:12px;">'+safe(t)+'</span>';}).join('')+'</div>';
+        return;
+      }
+      if(selectedTab==='outcomes'){
+        var outcomes=outcomeCache[p.id]||[];
+        if(!outcomes.length){document.getElementById('detail-body').innerHTML='<div class="muted">No outcomes recorded for this pattern yet.</div>';return;}
+        document.getElementById('detail-body').innerHTML='<table style="width:100%;border-collapse:collapse;font-size:13px;"><thead><tr><th style="text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">Task</th><th style="text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">Project</th><th style="text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">Result</th><th style="text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">Iterations</th><th style="text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">Tokens</th><th style="text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">When</th></tr></thead><tbody>'+outcomes.map(function(o){
+          var rc=o.succeeded?'#4ade80':'#f87171';
+          var runLink='<a href="/runs/'+encodeURIComponent(o.runId)+'" style="color:#60a5fa;text-decoration:none;font-size:12px;">open</a>';
+          return '<tr><td style="padding:8px 10px;border-bottom:1px solid #1e1e21;"><div style="font-weight:500;">'+safe(o.taskTitle||'(untitled)')+'</div><div style="font-family:ui-monospace,monospace;font-size:11px;color:var(--text-muted);">'+safe((o.taskId||'').slice(0,16))+'</div></td><td style="padding:8px 10px;border-bottom:1px solid #1e1e21;">'+safe(o.runProjectName||'—')+' · '+runLink+'</td><td style="padding:8px 10px;border-bottom:1px solid #1e1e21;"><span style="color:'+rc+';font-weight:500;">'+(o.succeeded?'success':'failure')+'</span></td><td style="padding:8px 10px;border-bottom:1px solid #1e1e21;">'+(o.iterations||'—')+'</td><td style="padding:8px 10px;border-bottom:1px solid #1e1e21;">'+((o.tokensUsed||0).toLocaleString())+'</td><td style="padding:8px 10px;border-bottom:1px solid #1e1e21;color:var(--text-muted);font-size:12px;">'+ago(o.createdAt)+'</td></tr>';
+        }).join('')+'</tbody></table>';
+      }
+    }
+
     async function selectPattern(id){
       selectedPatternId=id;
+      selectedTab='approach';
       renderPatterns();
       var p=allPatterns.find(function(x){return x.id===id;});
       if(!p){document.getElementById('pattern-detail').style.display='none';return;}
-
       document.getElementById('pattern-detail').style.display='block';
       var c=effColor(p.effectivenessScore);
-      document.getElementById('detail-content').innerHTML='<div class="card"><div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">'
-        +'<div><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:4px;">Task Kind</div><div style="font-weight:500;">'+safe(p.taskKind)+'</div></div>'
-        +'<div><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:4px;">File Pattern</div><div style="font-family:monospace;font-size:12px;">'+safe(p.filePattern)+'</div></div>'
-        +'<div><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:4px;">Effectiveness</div><div style="font-weight:500;color:'+c+'">'+(p.effectivenessScore*100).toFixed(1)+'%</div></div>'
-        +'<div><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:4px;">Project</div><div>'+safe(p.projectName)+'</div></div>'
-        +'<div><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:4px;">Times Applied</div><div>'+p.timesApplied+' ('+p.timesSucceeded+' ok, '+p.timesFailed+' fail)</div></div>'
-        +'<div><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:4px;">Iterations</div><div>'+(p.iterations||'—')+'</div></div>'
+      document.getElementById('detail-header').innerHTML='<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;">'
+        +'<div style="flex:1;min-width:200px;">'
+        +'<div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:4px;">Source Task</div>'
+        +'<div style="font-size:18px;font-weight:500;margin-bottom:4px;">'+safe(p.sourceTaskTitle||'(untitled)')+'</div>'
+        +'<div style="font-size:12px;color:var(--text-muted);">'+safe(p.sourceRunPrompt||'')+'</div>'
         +'</div>'
-        +'<div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:6px;">Approach</div>'
-        +'<pre style="background:var(--bg-app);padding:12px;border-radius:8px;border:1px solid var(--border);">'+safe(p.approach)+'</pre>'
-        +(p.tags&&p.tags.length?'<div style="margin-top:12px;display:flex;gap:6px;flex-wrap:wrap;">'+p.tags.map(function(t){return '<span style="padding:2px 8px;border-radius:99px;background:var(--bg-app);border:1px solid var(--border);font-size:11px;color:var(--text-muted);">'+safe(t)+'</span>';}).join('')+'</div>':'')
-        +'</div>';
+        +'<div style="display:flex;gap:12px;flex-shrink:0;flex-wrap:wrap;">'
+        +'<div style="background:var(--bg-app);border:1px solid var(--border);border-radius:8px;padding:10px 14px;"><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;">Effectiveness</div><div style="font-size:18px;font-weight:500;color:'+c+'">'+(p.effectivenessScore*100).toFixed(1)+'%</div></div>'
+        +'<div style="background:var(--bg-app);border:1px solid var(--border);border-radius:8px;padding:10px 14px;"><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;">Applied</div><div style="font-size:18px;font-weight:500;">'+p.timesApplied+'<span style="font-size:12px;color:var(--text-muted);margin-left:6px;">('+p.timesSucceeded+'/'+p.timesFailed+')</span></div></div>'
+        +'<div style="background:var(--bg-app);border:1px solid var(--border);border-radius:8px;padding:10px 14px;"><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;">Iterations</div><div style="font-size:18px;font-weight:500;">'+(p.iterations||'—')+'</div></div>'
+        +'<div style="background:var(--bg-app);border:1px solid var(--border);border-radius:8px;padding:10px 14px;"><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;">Tokens</div><div style="font-size:18px;font-weight:500;">'+((p.tokensUsed||0).toLocaleString())+'</div></div>'
+        +'</div></div>'
+        +'<div style="display:flex;gap:12px;margin-top:12px;font-size:12px;color:var(--text-muted);flex-wrap:wrap;"><span>Kind: <strong style="color:var(--text-main);">'+safe(p.taskKind)+'</strong></span><span>File pattern: <strong style="font-family:ui-monospace,monospace;color:var(--text-main);">'+safe(p.filePattern)+'</strong></span><span>Project: <strong style="color:var(--text-main);">'+safe(p.projectName)+'</strong></span></div>';
 
-      // Load outcomes
-      try{
-        var r=await fetch('/api/learning/patterns/'+encodeURIComponent(id)+'/outcomes');
-        var outcomes=await r.json();
-        var otb=document.querySelector('#outcome-table tbody');
-        otb.innerHTML=outcomes.length?outcomes.map(function(o){
-          var rc=o.succeeded?'#4ade80':'#f87171';
-          return '<tr><td style="font-family:monospace;font-size:12px">'+safe(o.taskId?.slice(0,12))+'</td><td style="font-family:monospace;font-size:12px">'+safe(o.runId?.slice(0,12))+'</td><td style="color:'+rc+';font-weight:500">'+(o.succeeded?'success':'failure')+'</td><td>'+(o.iterationsUsed||'—')+'</td><td style="color:var(--text-muted);font-size:12px">'+safe(o.createdAt?.slice(0,10))+'</td></tr>';
-        }).join(''):'<tr><td colspan="5" class="muted">No outcomes recorded for this pattern.</td></tr>';
-      }catch(e){console.error(e);}
+      // Fetch outcomes once per pattern
+      if(!outcomeCache[p.id]){
+        try{
+          var r=await fetch('/api/learning/patterns/'+encodeURIComponent(id)+'/outcomes');
+          outcomeCache[p.id]=await r.json();
+        }catch(e){outcomeCache[p.id]=[];}
+      }
+
+      renderDetailBody(p);
+    }
+
+    document.querySelectorAll('.pat-tab').forEach(function(tab){
+      tab.onclick=function(){
+        selectedTab=tab.dataset.tab;
+        document.querySelectorAll('.pat-tab').forEach(function(t){
+          var active=t===tab;
+          t.style.color=active?'var(--text-main)':'var(--text-muted)';
+          t.style.borderBottomColor=active?'var(--text-main)':'transparent';
+          t.classList.toggle('active',active);
+        });
+        var p=allPatterns.find(function(x){return x.id===selectedPatternId;});
+        if(p)renderDetailBody(p);
+      };
+    });
+
+    function populateProjectFilter(){
+      var sel=document.getElementById('pat-project-filter');
+      var projects=Array.from(new Set(allPatterns.map(function(p){return p.projectName;}))).sort();
+      sel.innerHTML='<option value="all">All Projects</option>'+projects.map(function(p){return '<option value="'+safe(p)+'">'+safe(p)+'</option>';}).join('');
     }
 
     async function load(){
-      const [statsR,patternsR]=await Promise.all([
-        fetch('/api/learning/stats'),fetch('/api/learning/patterns?limit=100')
+      const [statsR,patternsR,tagsR]=await Promise.all([
+        fetch('/api/learning/stats'),
+        fetch('/api/learning/patterns?limit=200'),
+        fetch('/api/learning/tags')
       ]);
       const stats=await statsR.json();
       allPatterns=await patternsR.json();
+      const tags=await tagsR.json();
 
       document.getElementById('learning-stats').innerHTML=[
-        ['Total Patterns',stats.totalPatterns,'#60a5fa'],['Effective',stats.effectivePatterns,'#4ade80'],
-        ['Applications',stats.totalApplications,'#a78bfa'],['Success Rate',(stats.overallSuccessRate*100).toFixed(1)+'%','#4ade80'],
-        ['Avg Iterations',stats.avgIterationsLearned?.toFixed(1)||'—','#f59e0b']
+        ['Total Patterns',stats.totalPatterns||0,'#60a5fa'],
+        ['Effective',stats.effectivePatterns||0,'#4ade80'],
+        ['Applications',stats.totalApplications||0,'#a78bfa'],
+        ['Success Rate',((stats.overallSuccessRate||0)*100).toFixed(1)+'%','#4ade80'],
+        ['Avg Iterations',stats.avgIterationsLearned?stats.avgIterationsLearned.toFixed(1):'—','#f59e0b']
       ].map(function(c){return '<div class="card"><div class="card-label">'+c[0]+'</div><div class="card-value" style="color:'+c[2]+'">'+c[1]+'</div></div>';}).join('');
 
+      populateProjectFilter();
+      renderTagCloud(tags);
       renderPatterns();
     }
 
     document.getElementById('pat-search').addEventListener('input',renderPatterns);
     document.getElementById('pat-kind-filter').addEventListener('change',renderPatterns);
+    document.getElementById('pat-project-filter').addEventListener('change',renderPatterns);
     load();
   `);
 }
@@ -2238,6 +2726,107 @@ export function startUnityHttpServer(runtime: RuntimeState) {
       if (req.method === 'GET' && pathname === '/api/runs/resumable') {
         sendJson(res, 200, unityStore.listResumableRuns());
         return;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/projects') {
+        sendJson(res, 200, listAvailableProjects());
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/api/runs') {
+        try {
+          const body = await readJsonBody(req);
+          const projectName = String(body.projectName || '').trim();
+          const prompt = String(body.prompt || '').trim();
+          const mode = body.mode === 'nightly' ? 'nightly' : 'interactive';
+
+          if (!projectName || !prompt) {
+            sendJson(res, 400, { error: 'projectName and prompt are required.' });
+            return;
+          }
+
+          const project = getProjectByName(projectName);
+          if (!fs.existsSync(project.repoPath)) {
+            sendJson(res, 404, { error: `Project "${projectName}" not found in ${WORKSPACE_DIR}.` });
+            return;
+          }
+
+          const plan = await createAutonomousRunPlan({
+            project,
+            prompt,
+            channelName: 'panel',
+            mode,
+          });
+
+          if (!plan.requiresApproval) {
+            // Nightly mode auto-approves — kick off the resumer in background.
+            resumeAutonomousRun({ runId: plan.runId }).catch((err) => {
+              console.error(`[panel] Autonomous run ${plan.runId} failed:`, err);
+            });
+          }
+
+          sendJson(res, 201, {
+            runId: plan.runId,
+            branchName: plan.branchName,
+            requiresApproval: plan.requiresApproval,
+            autoApproved: plan.autoApproved,
+            consoleUrl: plan.consoleUrl,
+            tasks: plan.tasks,
+          });
+          return;
+        } catch (err: any) {
+          sendJson(res, 500, { error: err?.message || 'Failed to create run.' });
+          return;
+        }
+      }
+
+      if (req.method === 'GET' && pathname === '/api/pair-sessions') {
+        sendJson(res, 200, pairSessions);
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/api/pair-sessions') {
+        try {
+          const body = await readJsonBody(req);
+          const projectName = String(body.projectName || '').trim();
+          const prompt = String(body.prompt || '').trim();
+          const isIteration = Boolean(body.isIteration);
+
+          if (!projectName || !prompt) {
+            sendJson(res, 400, { error: 'projectName and prompt are required.' });
+            return;
+          }
+
+          const project = getProjectByName(projectName);
+          if (!fs.existsSync(project.repoPath)) {
+            sendJson(res, 404, { error: `Project "${projectName}" not found.` });
+            return;
+          }
+
+          // Pair-mode runs are synchronous and may take a while. Kick off in
+          // background and track in the in-memory ledger so the panel can show them.
+          const sessionId = `pair-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          const record = recordPairSession(sessionId, projectName, prompt);
+          runDevelopmentTask({ project, prompt, isIteration })
+            .then((result) => {
+              record.status = 'succeeded';
+              record.finishedAt = new Date().toISOString();
+              record.commitMessage = result.commitMessage;
+              console.log(`[panel] Pair session ${sessionId} completed:`, result.commitMessage);
+            })
+            .catch((err) => {
+              record.status = 'failed';
+              record.finishedAt = new Date().toISOString();
+              record.error = err?.message || String(err);
+              console.error(`[panel] Pair session ${sessionId} failed:`, err);
+            });
+
+          sendJson(res, 202, { sessionId, projectName, prompt, mode: 'pair' });
+          return;
+        } catch (err: any) {
+          sendJson(res, 500, { error: err?.message || 'Failed to start pair session.' });
+          return;
+        }
       }
 
       if (req.method === 'GET' && extractRunId(pathname)) {
@@ -2398,14 +2987,36 @@ export function startUnityHttpServer(runtime: RuntimeState) {
       if (req.method === 'GET' && pathname === '/api/learning/patterns') {
         const limit = Number(url.searchParams.get('limit') || 20);
         const learningStore = getLearningStore();
-        sendJson(res, 200, learningStore.getTopPatterns(limit));
+        const patterns = learningStore.getTopPatterns(limit);
+        // Enrich each pattern with the source task's title so the UI can show it.
+        const enriched = patterns.map((p) => {
+          const sourceTask = p.sourceTaskId ? unityStore.getTask(p.sourceTaskId) : null;
+          const sourceRun = p.sourceRunId ? unityStore.getRun(p.sourceRunId) : null;
+          return {
+            ...p,
+            sourceTaskTitle: sourceTask?.title || null,
+            sourceRunPrompt: sourceRun?.prompt || null,
+          };
+        });
+        sendJson(res, 200, enriched);
         return;
       }
 
       if (req.method === 'GET' && pathname.startsWith('/api/learning/patterns/') && pathname.endsWith('/outcomes')) {
         const patternId = pathname.slice('/api/learning/patterns/'.length, -'/outcomes'.length);
         const learningStore = getLearningStore();
-        sendJson(res, 200, learningStore.getPatternOutcomes(patternId));
+        const outcomes = learningStore.getPatternOutcomes(patternId);
+        // Enrich each outcome with task title and run project for display.
+        const enriched = outcomes.map((o) => {
+          const task = unityStore.getTask(o.taskId);
+          const run = unityStore.getRun(o.runId);
+          return {
+            ...o,
+            taskTitle: task?.title || null,
+            runProjectName: run?.projectName || null,
+          };
+        });
+        sendJson(res, 200, enriched);
         return;
       }
 
@@ -2413,6 +3024,32 @@ export function startUnityHttpServer(runtime: RuntimeState) {
         const projectName = url.searchParams.get('project') || getRuntimeConfig().githubRepo;
         const learningStore = getLearningStore();
         sendJson(res, 200, learningStore.getProjectLearningStats(projectName));
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/learning/tags') {
+        // Aggregate tag frequency + average effectiveness across all patterns.
+        const learningStore = getLearningStore();
+        const allPatterns = learningStore.getTopPatterns(500);
+        const tagMap = new Map<string, { count: number; totalEff: number; totalApplied: number }>();
+        for (const p of allPatterns) {
+          for (const tag of p.tags || []) {
+            const entry = tagMap.get(tag) || { count: 0, totalEff: 0, totalApplied: 0 };
+            entry.count++;
+            entry.totalEff += p.effectivenessScore;
+            entry.totalApplied += p.timesApplied;
+            tagMap.set(tag, entry);
+          }
+        }
+        const tags = Array.from(tagMap.entries())
+          .map(([tag, v]) => ({
+            tag,
+            patternCount: v.count,
+            avgEffectiveness: v.count > 0 ? v.totalEff / v.count : 0,
+            totalApplications: v.totalApplied,
+          }))
+          .sort((a, b) => b.patternCount - a.patternCount);
+        sendJson(res, 200, tags);
         return;
       }
 

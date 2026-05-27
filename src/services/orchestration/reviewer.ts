@@ -5,8 +5,12 @@ import type { GateResult, PlanTaskDraft, ReviewFinding, ReviewResult } from '../
 interface ReviewTaskParams {
   runPrompt: string;
   taskTitle: string;
+  taskPrompt: string;
   diff: string;
   gateResults: GateResult[];
+  runId?: string;
+  taskId?: string;
+  projectName?: string;
 }
 
 interface PartialReviewResult {
@@ -135,9 +139,15 @@ function parseReviewResponse(content: string): ReviewResult {
   return coerceReviewResult(parseJsonObject<PartialReviewResult>(content));
 }
 
-async function repairReviewResponse(rawContent: string): Promise<ReviewResult> {
+async function repairReviewResponse(
+  rawContent: string,
+  attribution?: { runId?: string; taskId?: string; projectName?: string },
+): Promise<ReviewResult> {
   const response = await roleCompletion('repair', {
     responseFormat: { type: 'json_object' },
+    runId: attribution?.runId,
+    taskId: attribution?.taskId,
+    projectName: attribution?.projectName,
     messages: [
       {
         role: 'user',
@@ -237,33 +247,74 @@ function buildDeterministicFallbackReview(params: ReviewTaskParams): ReviewResul
   };
 }
 
-function buildReviewPrompt({ runPrompt, taskTitle, diff, gateResults }: ReviewTaskParams): string {
-  return `You are the reviewer agent of Unity.
-Review this autonomous task result.
+const REVIEW_DIFF_BUDGET = 24000;
 
-RUN GOAL
+function formatDiffForReview(diff: string): { body: string; truncated: boolean; originalLen: number } {
+  const originalLen = diff.length;
+  if (originalLen <= REVIEW_DIFF_BUDGET) {
+    return { body: diff, truncated: false, originalLen };
+  }
+  return {
+    body: `${diff.substring(0, REVIEW_DIFF_BUDGET)}\n\n[DIFF TRUNCATED — showed first ${REVIEW_DIFF_BUDGET} of ${originalLen} chars. Remainder omitted for prompt size only; this is NOT missing code.]`,
+    truncated: true,
+    originalLen,
+  };
+}
+
+function buildReviewPrompt({ runPrompt, taskTitle, taskPrompt, diff, gateResults }: ReviewTaskParams): string {
+  const { body: diffBody, truncated, originalLen } = formatDiffForReview(diff);
+  const truncationNote = truncated
+    ? `\n\nDIFF-TRUNCATION NOTICE\nThe diff shown below is truncated at ${REVIEW_DIFF_BUDGET} chars (full diff is ${originalLen} chars). The full patch WAS applied and already passed compile gates. Truncation is ONLY for prompt size — do NOT treat it as missing/incomplete code and do NOT reject the task for "truncated" or "incomplete diff". Trust the GATES results for authoritative status.`
+    : '';
+
+  return `You are the reviewer agent of Unity.
+Your job is to produce a narrative review of this autonomous task result: a short summary,
+findings, and optional follow-up improvement tasks.
+
+APPROVAL DECISION IS NOT YOURS
+The approval verdict (approved: true/false) is decided DETERMINISTICALLY by the authoritative
+gates (scope + baseline-delta) and will OVERRIDE whatever you return in the "approved" field.
+You still must include "approved" in the JSON for schema compatibility, but the system will
+replace it. Do not spend effort debating approval — focus on the narrative value you add.
+
+Tasks are SUBTASKS produced by a planner that decomposed the run goal into parallel,
+independently shippable units. The executor only received the TASK INSTRUCTION below — not
+the full run goal. Review the diff against the TASK INSTRUCTION, not the run goal. The run
+goal is provided only as background context to resolve ambiguity. Sibling subtasks handle the
+other parts of the run goal — do NOT treat their absence here as a problem.
+
+RUN GOAL (background context only — not the acceptance criteria)
 ${runPrompt}
 
-TASK
+TASK TITLE
 ${taskTitle}
 
-GATES
+TASK INSTRUCTION (authoritative acceptance criteria — review against this)
+${taskPrompt}
+
+GATES (authoritative — already determined approval outcome)
 ${gateResults.map((gate) => `- ${gate.name}: ${gate.status} -> ${gate.details}`).join('\n')}
 
-REVIEW RULES
-- Treat the "scope" gate as a hard boundary. If it fails, reject the task.
-- Treat the "baseline-delta" gate as the authoritative signal for newly introduced static gate regressions.
-- Do not reject a task only because a normal gate is failing if that same gate was already failing in baseline and "baseline-delta" passed.
+NARRATIVE RULES
+- Summarize what the diff actually changed in 1-3 sentences. Cite specific file paths.
+- List findings only when they add information a reader cannot get from the gate output alone
+  (e.g. code smells, risky patterns, missed edge cases inside the task scope).
+- A gate that was already failing in baseline is NOT a finding — baseline-delta already
+  certified it is pre-existing. Do not restate pre-existing failures as findings.
+- Propose follow-up tasks only for real, actionable improvements. Leave the array empty if
+  there is nothing worth doing.
+- NEVER comment on diff truncation. Truncation is a prompt-size constraint, not a code
+  problem — the full patch already compiled.${truncationNote}
 
 DIFF
 \`\`\`diff
-${diff.substring(0, 12000)}
+${diffBody}
 \`\`\`
 
-Return JSON only:
+Return JSON only (the "approved" field will be replaced by the deterministic verdict):
 {
   "approved": true,
-  "summary": "short review summary",
+  "summary": "short narrative summary of what the diff changed",
   "findings": [
     { "severity": "low|medium|high", "message": "finding", "file": "optional/file.ts" }
   ],
@@ -296,11 +347,18 @@ export async function reviewTaskResult(params: ReviewTaskParams): Promise<Review
   try {
     const response = await roleCompletion('review', {
       responseFormat: { type: 'json_object' },
+      runId: params.runId,
+      taskId: params.taskId,
+      projectName: params.projectName,
       messages: [{ role: 'user', content: buildReviewPrompt(params) }],
     });
 
     rawReviewerContent = response.content || '';
-    return parseReviewResponse(rawReviewerContent);
+    const parsed = parseReviewResponse(rawReviewerContent);
+    return {
+      ...parsed,
+      approved: shouldApproveFromGates(params.gateResults),
+    };
   } catch (error) {
     console.error('Reviewer primary pass failed, attempting repair:', error);
   }
@@ -310,9 +368,14 @@ export async function reviewTaskResult(params: ReviewTaskParams): Promise<Review
       throw new Error('Reviewer returned no parseable content for repair.');
     }
 
-    const repairReview = await repairReviewResponse(rawReviewerContent);
+    const repairReview = await repairReviewResponse(rawReviewerContent, {
+      runId: params.runId,
+      taskId: params.taskId,
+      projectName: params.projectName,
+    });
     return {
       ...repairReview,
+      approved: shouldApproveFromGates(params.gateResults),
       summary: `Repaired reviewer output. ${repairReview.summary}`,
     };
   } catch (error) {

@@ -1,9 +1,12 @@
 /**
  * Model Router — maps agent roles to model configurations.
  *
- * Each role (planning, code-gen, review, etc.) gets a model tier
- * with appropriate temperature, token limits, and provider hints.
+ * All roles run on the unified `deepseek-v4-pro` model. The separation between
+ * reasoning and chat behaviour is now controlled per-request through the
+ * thinking toggle and reasoning effort instead of separate model names.
  */
+
+import type { ReasoningEffort } from './providers/types.js';
 
 export type AgentRole =
   | 'planning'
@@ -17,73 +20,93 @@ export type AgentRole =
 export type ModelTier = 'reasoning' | 'chat' | 'fast';
 
 export interface ModelConfig {
-  /** Model identifier (e.g. 'deepseek-reasoner', 'deepseek-chat') */
+  /** Model identifier (e.g. 'deepseek-v4-pro') */
   model: string;
   /** Provider key for the provider registry */
   provider: string;
-  /** Default temperature for this role */
+  /** Default temperature for this role (ignored when thinking is enabled) */
   temperature: number;
   /** Default max output tokens */
   maxTokens: number;
   /** Model tier classification */
   tier: ModelTier;
+  /** Whether to enable the model's thinking pass for this role. */
+  thinking: boolean;
+  /** Effort budget applied when `thinking` is true. */
+  reasoningEffort?: ReasoningEffort;
 }
 
 /**
  * Default role-to-model mapping.
- * Code-gen and PR metadata use the reasoning model for higher quality.
- * Planning and review use the chat model for speed and cost.
- * Repair (JSON fix-up) uses chat with low temperature.
+ * Reasoning-tier roles run with thinking enabled; chat-tier roles disable it
+ * so temperature/penalty knobs still apply.
  */
 const DEFAULT_MODEL_MAP: Record<AgentRole, ModelConfig> = {
   'code-gen': {
-    model: 'deepseek-reasoner',
+    model: 'deepseek-v4-pro',
     provider: 'deepseek',
-    temperature: 0.1,
-    maxTokens: 8192,
+    temperature: 0.2,
+    maxTokens: 120000,
     tier: 'reasoning',
+    thinking: true,
+    reasoningEffort: 'max',
   },
+
   'pr-metadata': {
-    model: 'deepseek-reasoner',
+    model: 'deepseek-v4-pro',
+    provider: 'deepseek',
+    temperature: 0.4,
+    maxTokens: 10000,
+    tier: 'chat',
+    thinking: false,
+  },
+
+  planning: {
+    model: 'deepseek-v4-pro',
+    provider: 'deepseek',
+    temperature: 0.4,
+    maxTokens: 120000,
+    tier: 'reasoning',
+    thinking: true,
+    reasoningEffort: 'high',
+  },
+
+  review: {
+    model: 'deepseek-v4-pro',
+    provider: 'deepseek',
+    temperature: 0,
+    maxTokens: 30000,
+    tier: 'chat',
+    thinking: false,
+  },
+
+  repair: {
+    model: 'deepseek-v4-pro',
+    provider: 'deepseek',
+    temperature: 0,
+    maxTokens: 25000,
+    tier: 'chat',
+    thinking: false,
+  },
+
+  explorer: {
+    model: 'deepseek-v4-pro',
+    provider: 'deepseek',
+    temperature: 0.2,
+    maxTokens: 120000,
+    tier: 'reasoning',
+    thinking: true,
+    reasoningEffort: 'high',
+  },
+
+  architect: {
+    model: 'deepseek-v4-pro',
     provider: 'deepseek',
     temperature: 0.3,
-    maxTokens: 500,
+    maxTokens: 120000,
     tier: 'reasoning',
-  },
-  planning: {
-    model: 'deepseek-chat',
-    provider: 'deepseek',
-    temperature: 0.2,
-    maxTokens: 2200,
-    tier: 'chat',
-  },
-  review: {
-    model: 'deepseek-chat',
-    provider: 'deepseek',
-    temperature: 0,
-    maxTokens: 1800,
-    tier: 'chat',
-  },
-  repair: {
-    model: 'deepseek-chat',
-    provider: 'deepseek',
-    temperature: 0,
-    maxTokens: 900,
-    tier: 'chat',
-  },
-  explorer: {
-    model: 'deepseek-chat',
-    provider: 'deepseek',
-    temperature: 0.1,
-    maxTokens: 4096,
-    tier: 'chat',
-  },
-  architect: {
-    model: 'deepseek-reasoner',
-    provider: 'deepseek',
-    temperature: 0.2,
-    maxTokens: 4096,
-    tier: 'reasoning',
+    thinking: true,
+    reasoningEffort: 'max',
   },
 };
 

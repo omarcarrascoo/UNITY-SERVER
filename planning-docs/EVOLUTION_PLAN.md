@@ -172,7 +172,7 @@
 ### 4.1 Model Router ✅
 - New `AgentRole` type with 5 roles: `planning`, `code-gen`, `review`, `pr-metadata`, `repair`
 - Each role maps to a `ModelConfig` with: model, provider, temperature, maxTokens, tier
-- Default mapping: code-gen/pr-metadata → `deepseek-reasoner` (reasoning tier), planning/review/repair → `deepseek-chat` (chat tier)
+- Default mapping: all roles run on `deepseek-v4-pro`; reasoning tier (code-gen/pr-metadata/architect) enables thinking mode with `reasoning_effort`, chat tier (planning/review/repair/explorer) disables it
 - `configureModelRouter()` allows runtime overrides (e.g., from env vars or policy)
 - **File created**: `src/services/ai/model-router.ts`
 

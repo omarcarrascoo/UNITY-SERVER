@@ -149,17 +149,27 @@ export async function planMultiRepoRun(params: {
   });
 
   try {
-    const response = await roleCompletion('planning', {
-      messages: [
-        {
-          role: 'user',
-          content: buildMultiRepoPlannerPrompt({
-            prompt: params.prompt,
-            repos: repoContexts,
-          }),
-        },
-      ],
+    const userMessage = {
+      role: 'user' as const,
+      content: buildMultiRepoPlannerPrompt({
+        prompt: params.prompt,
+        repos: repoContexts,
+      }),
+    };
+
+    let response = await roleCompletion('planning', {
+      messages: [userMessage],
+      responseFormat: { type: 'json_object' },
     });
+
+    if (!(response.content || '').trim()) {
+      console.warn('⚠️ Multi-repo planner returned empty content under thinking mode. Retrying with thinking disabled.');
+      response = await roleCompletion('planning', {
+        messages: [userMessage],
+        responseFormat: { type: 'json_object' },
+        thinking: false,
+      });
+    }
 
     const content = response.content || '';
     const plan = parseJsonObject<MultiRepoPlan>(content);

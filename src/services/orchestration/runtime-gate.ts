@@ -61,6 +61,58 @@ function getPackageManagerHint(dir: string): string {
   return 'npm';
 }
 
+function getInstallCommand(dir: string): string {
+  const hint = getPackageManagerHint(dir);
+  if (hint === 'yarn') return 'yarn install';
+  if (hint === 'pnpm') return 'pnpm install';
+  return 'npm install';
+}
+
+async function ensureNodeModules(
+  service: RuntimeServiceConfig,
+  onLog?: RuntimeLogFn,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!service.requiresNodeModules) return { ok: true };
+  if (hasNodeModules(service.cwd)) return { ok: true };
+
+  if (!fs.existsSync(path.join(service.cwd, 'package.json'))) {
+    return {
+      ok: false,
+      error: `${service.name} prerequisites missing: no package.json found in ${service.cwd}.`,
+    };
+  }
+
+  const installCmd = getInstallCommand(service.cwd);
+  await emitRuntimeLog(
+    onLog,
+    `📦 [runtime:${service.name}] node_modules missing in ${service.cwd} — running \`${installCmd}\` (may take a while).`,
+  );
+
+  try {
+    await execPromise(installCmd, {
+      cwd: service.cwd,
+      timeout: 300_000,
+      maxBuffer: 50 * 1024 * 1024,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      error: `${service.name} prerequisites missing: auto-install failed in ${service.cwd}. ${message}`,
+    };
+  }
+
+  if (!hasNodeModules(service.cwd)) {
+    return {
+      ok: false,
+      error: `${service.name} prerequisites missing: auto-install completed but node_modules still absent in ${service.cwd}.`,
+    };
+  }
+
+  await emitRuntimeLog(onLog, `✅ [runtime:${service.name}] node_modules restored via auto-install.`);
+  return { ok: true };
+}
+
 function injectEnvVar(dir: string, key: string, value: string): void {
   const envPath = path.join(dir, '.env');
   let content = '';
@@ -81,11 +133,11 @@ async function startService(
   service: RuntimeServiceConfig,
   onLog?: RuntimeLogFn,
 ): Promise<{ proc: ChildProcess; log: string } | { error: string }> {
-  // Pre-flight: check node_modules
-  if (service.requiresNodeModules && !hasNodeModules(service.cwd)) {
-    const details = `${service.name} prerequisites missing: node_modules not found in ${service.cwd}. Expected: ${getPackageManagerHint(service.cwd)}.`;
-    await emitRuntimeLog(onLog, `❌ [runtime:${service.name}] ${details}`);
-    return { error: details };
+  // Pre-flight: ensure node_modules (auto-install if missing)
+  const nodeModulesCheck = await ensureNodeModules(service, onLog);
+  if (!nodeModulesCheck.ok) {
+    await emitRuntimeLog(onLog, `❌ [runtime:${service.name}] ${nodeModulesCheck.error}`);
+    return { error: nodeModulesCheck.error };
   }
 
   // Kill existing port occupants

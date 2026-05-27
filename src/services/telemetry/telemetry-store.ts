@@ -47,19 +47,46 @@ export interface TaskCostEntry {
   durationMs: number;
 }
 
-/** Approximate costs per 1M tokens (input/output averaged). */
-const MODEL_COST_PER_1M: Record<string, number> = {
-  'deepseek-reasoner': 2.19,
-  'deepseek-chat': 0.27,
-  'claude-opus-4': 75.0,
-  'claude-sonnet-4': 15.0,
-  'claude-haiku-4-5': 4.0,
+/**
+ * Per-model pricing (USD per 1M tokens), split by input / output / cached-input.
+ * Cached input is what the provider discounts for repeated prefix content.
+ * Reasoning tokens are billed as output tokens by DeepSeek — no separate row needed.
+ */
+interface ModelPricing {
+  input: number;
+  output: number;
+  cachedInput: number;
+}
+
+const MODEL_PRICING: Record<string, ModelPricing> = {
+  'deepseek-v4-pro': { input: 0.56, output: 1.68, cachedInput: 0.07 },
+  // Legacy aliases so historical rows still resolve a cost.
+  'deepseek-reasoner': { input: 0.56, output: 1.68, cachedInput: 0.07 },
+  'deepseek-chat': { input: 0.27, output: 1.1, cachedInput: 0.07 },
+  'claude-opus-4': { input: 15.0, output: 75.0, cachedInput: 1.5 },
+  'claude-sonnet-4': { input: 3.0, output: 15.0, cachedInput: 0.3 },
+  'claude-haiku-4-5': { input: 1.0, output: 5.0, cachedInput: 0.1 },
 };
 
-function estimateCostUsd(model: string | null, totalTokens: number): number {
-  if (!model || !totalTokens) return 0;
-  const costPer1M = MODEL_COST_PER_1M[model] ?? 1.0;
-  return (totalTokens / 1_000_000) * costPer1M;
+const FALLBACK_PRICING: ModelPricing = { input: 1.0, output: 3.0, cachedInput: 0.1 };
+
+export interface TokenBreakdown {
+  promptTokens: number;
+  completionTokens: number;
+  cachedPromptTokens?: number;
+}
+
+export function estimateCostUsd(model: string | null, breakdown: TokenBreakdown): number {
+  if (!model) return 0;
+  const pricing = MODEL_PRICING[model] ?? FALLBACK_PRICING;
+  const cached = breakdown.cachedPromptTokens ?? 0;
+  const billedPrompt = Math.max(0, breakdown.promptTokens - cached);
+
+  return (
+    (billedPrompt / 1_000_000) * pricing.input +
+    (cached / 1_000_000) * pricing.cachedInput +
+    (breakdown.completionTokens / 1_000_000) * pricing.output
+  );
 }
 
 function nowIso(): string {
@@ -109,7 +136,14 @@ export class TelemetryStore {
 
   emit(event: Omit<TelemetryEvent, 'id' | 'createdAt' | 'costUsd'> & { costUsd?: number }): string {
     const id = `tel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const costUsd = event.costUsd ?? estimateCostUsd(event.model, event.tokensTotal ?? 0);
+    const cachedPromptTokens = (event.metadata as any)?.cachedPromptTokens ?? 0;
+    const costUsd =
+      event.costUsd ??
+      estimateCostUsd(event.model, {
+        promptTokens: event.tokensInput ?? 0,
+        completionTokens: event.tokensOutput ?? 0,
+        cachedPromptTokens,
+      });
 
     this.db
       .prepare(`

@@ -29,7 +29,7 @@
 - **Isolated node_modules** — detects dependency-modifying tasks and runs `npm install` instead of symlinking
 
 ### Phase 4: Multi-Model Strategy
-- **Model Router** (`model-router.ts`): 7 roles mapped to models — code-gen/pr-metadata/architect use `deepseek-reasoner`, planning/review/repair/explorer use `deepseek-chat`
+- **Model Router** (`model-router.ts`): 7 roles mapped to `deepseek-v4-pro` — code-gen/pr-metadata/architect enable thinking mode with `reasoning_effort`, planning/review/repair/explorer run in chat mode (thinking disabled)
 - **Provider Abstraction** (`completion.ts` + `providers/`): Normalized request/response types, fallback registry, single `roleCompletion()` entry point
 - **Token Budget Tracking** (`token-tracker.ts`): 2M per run, 500K per task, warning at 75%, hard stop at 100%
 

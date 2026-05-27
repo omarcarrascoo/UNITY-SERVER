@@ -231,6 +231,17 @@ function extractChangedPaths(diff: string): string[] {
   return Array.from(paths);
 }
 
+function stripKnownPackagePrefix(filePath: string, packageDirs: string[]): string {
+  for (const packageDir of packageDirs) {
+    if (!packageDir || packageDir === '.') continue;
+    if (filePath === packageDir) return '';
+    if (filePath.startsWith(`${packageDir}/`)) {
+      return filePath.slice(packageDir.length + 1);
+    }
+  }
+  return filePath;
+}
+
 function getOutOfScopePaths(workspace: PreparedWorkspace, diff: string, scopes: string[]): string[] {
   const normalizedScopes = normalizeScopes(scopes);
   if (normalizedScopes.includes('.')) {
@@ -238,13 +249,26 @@ function getOutOfScopePaths(workspace: PreparedWorkspace, diff: string, scopes: 
   }
 
   const allowedPackageDirs = getAllowedPackageDirs(workspace, normalizedScopes);
+  const allPackageDirs = getRelativePackageDirs(workspace);
   return extractChangedPaths(diff).filter((filePath) => {
+    // Exact match against a declared scope (repo-root-relative path)
     if (normalizedScopes.some((scope) => isPathWithinScope(filePath, scope))) {
       return false;
     }
 
+    // Path falls inside an allowed package directory
     if (allowedPackageDirs.some((packageDir) => isPathWithinScope(filePath, packageDir))) {
       return false;
+    }
+
+    // Planner sometimes writes scopes as package-relative (e.g. app/profile.tsx)
+    // while the diff carries repo-root paths (e.g. kubo-mobile/app/profile.tsx).
+    // Strip a known package prefix and re-check.
+    const stripped = stripKnownPackagePrefix(filePath, allPackageDirs);
+    if (stripped && stripped !== filePath) {
+      if (normalizedScopes.some((scope) => isPathWithinScope(stripped, scope))) {
+        return false;
+      }
     }
 
     return true;
@@ -590,9 +614,21 @@ async function executeTask(
       signal: taskSignal,
       runId: run.id,
       taskId: task.id,
+      projectName: run.projectName,
       onStatusUpdate: (status, thought) => {
         if (!onProgress) return;
         return onProgress(`🧩 [${task.title}] ${status}${thought ? `\n> ${thought}` : ''}`);
+      },
+      onThinking: (iteration, reasoning) => {
+        const trimmed = reasoning.length > 2048 ? reasoning.slice(0, 2048) + '…' : reasoning;
+        unityStore.addEvent(
+          createEntityId('event'),
+          run.id,
+          task.id,
+          'info',
+          'agent.thinking',
+          `Iteration ${iteration}: ${trimmed}`,
+        );
       },
     });
 
@@ -646,8 +682,12 @@ async function executeTask(
     const review = await reviewTaskResult({
       runPrompt: run.prompt,
       taskTitle: task.title,
+      taskPrompt: task.prompt,
       diff,
       gateResults: staticGates,
+      runId: run.id,
+      taskId: task.id,
+      projectName: run.projectName,
     });
 
     if (onProgress) {
@@ -1553,6 +1593,8 @@ export async function createAutonomousRunPlan({
     prompt,
     projectTree,
     projectMemory,
+    runId: run.id,
+    projectName: project.name,
   });
 
   const autoApproved = shouldAutoApprovePlan(mode, policy);
