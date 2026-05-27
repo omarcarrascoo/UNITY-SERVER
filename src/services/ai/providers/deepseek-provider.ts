@@ -96,14 +96,24 @@ export class DeepSeekProvider implements LLMProvider {
         ? message.reasoning_content
         : null;
 
+    const usage = response.usage ?? {};
+    const cachedPromptTokens =
+      (usage as any).prompt_cache_hit_tokens ??
+      (usage as any).prompt_tokens_details?.cached_tokens ??
+      0;
+    const reasoningTokens =
+      (usage as any).completion_tokens_details?.reasoning_tokens ?? 0;
+
     return {
       content: message?.content ?? null,
       toolCalls,
       reasoningContent,
       usage: {
-        promptTokens: response.usage?.prompt_tokens ?? 0,
-        completionTokens: response.usage?.completion_tokens ?? 0,
-        totalTokens: response.usage?.total_tokens ?? 0,
+        promptTokens: (usage as any).prompt_tokens ?? 0,
+        completionTokens: (usage as any).completion_tokens ?? 0,
+        totalTokens: (usage as any).total_tokens ?? 0,
+        cachedPromptTokens,
+        reasoningTokens,
       },
       raw: response,
     };

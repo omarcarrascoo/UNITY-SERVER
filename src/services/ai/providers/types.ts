@@ -65,6 +65,10 @@ export interface LLMCompletionResponse {
     promptTokens: number;
     completionTokens: number;
     totalTokens: number;
+    /** Cached prompt tokens (billed at a reduced rate by most providers). */
+    cachedPromptTokens?: number;
+    /** Reasoning/thinking tokens included in completionTokens (billed as output). */
+    reasoningTokens?: number;
   };
   /** Raw provider-specific response for edge cases */
   raw?: unknown;

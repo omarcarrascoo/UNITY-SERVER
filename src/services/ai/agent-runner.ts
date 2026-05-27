@@ -24,9 +24,11 @@ export async function generateAndWriteCode({
   projectMemory,
   currentDiff,
   onStatusUpdate,
+  onThinking,
   signal,
   runId,
   taskId,
+  projectName,
   learnedPatterns,
   architectContext,
 }: GenerateCodeParams): Promise<{ targetRoute: string; commitMessage: string; tokenUsage: number; iterations: number; toolHistory: string[]; filesRead: string[] }> {
@@ -71,9 +73,18 @@ export async function generateAndWriteCode({
       signal,
       runId,
       taskId,
+      projectName,
     });
 
     totalTokens += response.usage.totalTokens;
+
+    if (onThinking && typeof response.reasoningContent === 'string' && response.reasoningContent.trim()) {
+      try {
+        onThinking(loop, response.reasoningContent);
+      } catch (err) {
+        console.warn('onThinking callback threw (non-fatal):', err);
+      }
+    }
 
     const agentContent = response.content?.trim() || '';
     const agentToolCalls = response.toolCalls;
@@ -145,7 +156,7 @@ export async function generateAndWriteCode({
           telemetry.redirectSpiral({
             runId,
             taskId,
-            projectName: '',
+            projectName: projectName ?? 'unknown',
             consecutiveRedirects,
             iterationCount: loop,
             toolsStripped: consecutiveRedirects >= 3,

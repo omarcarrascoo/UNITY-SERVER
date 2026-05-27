@@ -614,9 +614,21 @@ async function executeTask(
       signal: taskSignal,
       runId: run.id,
       taskId: task.id,
+      projectName: run.projectName,
       onStatusUpdate: (status, thought) => {
         if (!onProgress) return;
         return onProgress(`🧩 [${task.title}] ${status}${thought ? `\n> ${thought}` : ''}`);
+      },
+      onThinking: (iteration, reasoning) => {
+        const trimmed = reasoning.length > 2048 ? reasoning.slice(0, 2048) + '…' : reasoning;
+        unityStore.addEvent(
+          createEntityId('event'),
+          run.id,
+          task.id,
+          'info',
+          'agent.thinking',
+          `Iteration ${iteration}: ${trimmed}`,
+        );
       },
     });
 
@@ -673,6 +685,9 @@ async function executeTask(
       taskPrompt: task.prompt,
       diff,
       gateResults: staticGates,
+      runId: run.id,
+      taskId: task.id,
+      projectName: run.projectName,
     });
 
     if (onProgress) {
@@ -1578,6 +1593,8 @@ export async function createAutonomousRunPlan({
     prompt,
     projectTree,
     projectMemory,
+    runId: run.id,
+    projectName: project.name,
   });
 
   const autoApproved = shouldAutoApprovePlan(mode, policy);

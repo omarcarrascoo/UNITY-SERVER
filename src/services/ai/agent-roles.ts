@@ -239,6 +239,7 @@ export async function runExplorerAgent(params: {
       signal: params.signal,
       runId: params.runId,
       taskId: params.taskId,
+      projectName: params.projectName,
     });
 
     totalTokens += response.usage.totalTokens;
@@ -417,6 +418,7 @@ export async function runArchitectAgent(params: {
   onProgress?: (message: string) => void;
   runId?: string;
   taskId?: string;
+  projectName?: string;
 }): Promise<{ plan: ArchitectPlan; tokensUsed: number }> {
   if (params.signal?.aborted) throw new Error('AbortError');
 
@@ -438,6 +440,7 @@ export async function runArchitectAgent(params: {
     signal: params.signal,
     runId: params.runId,
     taskId: params.taskId,
+    projectName: params.projectName,
   });
 
   const content = response.content?.trim() || '';
@@ -563,6 +566,7 @@ export async function runAgentPipeline(params: {
     onProgress: params.onProgress,
     runId: params.runId,
     taskId: params.taskId,
+    projectName: params.projectName,
   });
 
   params.onProgress?.(`📐 Architect complete: ${plan.fileChanges.length} file changes planned`);

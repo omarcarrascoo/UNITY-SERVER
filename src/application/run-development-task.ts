@@ -100,6 +100,7 @@ export async function runDevelopmentTask({
     currentDiff,
     onStatusUpdate: onAgentStatusUpdate,
     signal,
+    projectName: project.name,
   });
 
   const sessionId = Date.now().toString().slice(-6);

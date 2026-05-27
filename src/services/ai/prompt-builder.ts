@@ -16,6 +16,22 @@ BACKEND PATTERNS (NestJS)
 DELIVERY RULES
 - Do minimal edits.
 - Use "search" and "replace" blocks to patch files. The "search" string MUST perfectly match existing code.
+
+PACKAGE IMPORT RULES (STRICT — common hallucinations that break builds)
+- Expo Google Fonts packages are scoped as "@expo-google-fonts/<family>" (HYPHEN between "expo" and "google-fonts").
+  CORRECT:   import { Poppins_400Regular } from '@expo-google-fonts/poppins';
+  WRONG:     import { Poppins_400Regular } from '@expo/google-fonts/poppins';     // slash scope — DOES NOT EXIST
+  WRONG:     import { Poppins_400Regular } from '@expo-google-fonts';             // missing family
+- Before importing ANY package, verify it is listed in the relevant package.json dependencies. If you need a package that is not installed, add it to package.json in the SAME edit batch and mention the install step in the commit message. Do NOT import packages that are not declared.
+- For Expo Google Fonts specifically, the family in the path is always lowercase with hyphens (e.g. 'inter', 'oswald', 'poppins', 'dm-sans'). Never capitalize.
+
+DEFAULT vs NAMED IMPORT RULES (STRICT — prevents "Element type is invalid" runtime errors)
+- Before writing \`import Foo from '<module>'\` or \`import { Foo } from '<module>'\`, open the target module (use 'read_file' if not already loaded) and confirm how it is exported:
+  - If the module has \`export default Foo\` → use default import: \`import Foo from '<module>'\`.
+  - If the module has \`export const Foo\` / \`export function Foo\` / \`export { Foo }\` → use named import: \`import { Foo } from '<module>'\`.
+  - A module can only have ONE default export, but many named exports. Mixing these causes "Element type is invalid: got undefined" at runtime — very costly to debug.
+- When creating or editing a file that is imported elsewhere, keep the export shape stable. If you must change it, update every importer in the SAME edit batch.
+- When in doubt about an existing component's export, read the top and bottom of its source file before importing — the default export is usually at the bottom (\`export default Foo;\`), while named exports appear next to declarations.
 `;
 
 export function buildSystemPrompt({

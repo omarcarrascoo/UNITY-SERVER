@@ -6,6 +6,8 @@ interface PlanRunParams {
   prompt: string;
   projectTree: string;
   projectMemory: string | null;
+  runId?: string;
+  projectName?: string;
 }
 
 const ADVISORY_TITLE_PATTERN =
@@ -161,6 +163,8 @@ async function requestPlan(params: PlanRunParams): Promise<string> {
   const primary = await roleCompletion('planning', {
     messages: [userMessage],
     responseFormat: { type: 'json_object' },
+    runId: params.runId,
+    projectName: params.projectName,
   });
 
   const primaryContent = (primary.content || '').trim();
@@ -178,6 +182,8 @@ async function requestPlan(params: PlanRunParams): Promise<string> {
     messages: [userMessage],
     responseFormat: { type: 'json_object' },
     thinking: false,
+    runId: params.runId,
+    projectName: params.projectName,
   });
 
   return (fallback.content || '').trim();

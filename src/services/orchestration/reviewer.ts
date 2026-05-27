@@ -8,6 +8,9 @@ interface ReviewTaskParams {
   taskPrompt: string;
   diff: string;
   gateResults: GateResult[];
+  runId?: string;
+  taskId?: string;
+  projectName?: string;
 }
 
 interface PartialReviewResult {
@@ -136,9 +139,15 @@ function parseReviewResponse(content: string): ReviewResult {
   return coerceReviewResult(parseJsonObject<PartialReviewResult>(content));
 }
 
-async function repairReviewResponse(rawContent: string): Promise<ReviewResult> {
+async function repairReviewResponse(
+  rawContent: string,
+  attribution?: { runId?: string; taskId?: string; projectName?: string },
+): Promise<ReviewResult> {
   const response = await roleCompletion('repair', {
     responseFormat: { type: 'json_object' },
+    runId: attribution?.runId,
+    taskId: attribution?.taskId,
+    projectName: attribution?.projectName,
     messages: [
       {
         role: 'user',
@@ -338,6 +347,9 @@ export async function reviewTaskResult(params: ReviewTaskParams): Promise<Review
   try {
     const response = await roleCompletion('review', {
       responseFormat: { type: 'json_object' },
+      runId: params.runId,
+      taskId: params.taskId,
+      projectName: params.projectName,
       messages: [{ role: 'user', content: buildReviewPrompt(params) }],
     });
 
@@ -356,7 +368,11 @@ export async function reviewTaskResult(params: ReviewTaskParams): Promise<Review
       throw new Error('Reviewer returned no parseable content for repair.');
     }
 
-    const repairReview = await repairReviewResponse(rawReviewerContent);
+    const repairReview = await repairReviewResponse(rawReviewerContent, {
+      runId: params.runId,
+      taskId: params.taskId,
+      projectName: params.projectName,
+    });
     return {
       ...repairReview,
       approved: shouldApproveFromGates(params.gateResults),

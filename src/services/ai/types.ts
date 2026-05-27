@@ -32,10 +32,14 @@ export interface BuildSystemPromptParams {
 export interface GenerateCodeParams extends BuildSystemPromptParams {
   repoPath: string;
   onStatusUpdate?: (status: string, thought?: string) => void;
+  /** Stream per-iteration chain-of-thought from the model (when available). */
+  onThinking?: (iteration: number, reasoning: string) => void;
   signal?: AbortSignal;
   /** For token budget tracking */
   runId?: string;
   taskId?: string;
+  /** Project name for telemetry attribution */
+  projectName?: string;
   /** Pre-computed context from the Explorer→Architect pipeline */
   architectContext?: string | null;
 }
