@@ -38,6 +38,11 @@ import { createTaskWorktree, removeTaskWorktree } from '../services/orchestratio
 import { buildLearningContext, extractPattern, recordPatternOutcomes } from '../services/learning/index.js';
 import { runAgentPipeline } from '../services/ai/agent-roles.js';
 import { getKnowledgeGraph } from '../services/knowledge/index.js';
+import {
+  isA2ADelegationEnabled,
+  delegateImplementation,
+  type ImplementationResult,
+} from '../a2a/delegate-implementation.js';
 
 interface RunAutonomousAgentParams {
   project: WorkspaceProject;
@@ -563,74 +568,102 @@ async function executeTask(
       await onProgress(`📚 [${task.title}] Injecting ${learningContext.appliedPatternIds.length} learned pattern(s).`);
     }
 
-    // Run Explorer → Architect pipeline for richer context
-    let architectContext: string | null = null;
-    try {
-      if (onProgress) {
-        await onProgress(`🔍 [${task.title}] Running Explorer → Architect pipeline...`);
-      }
-      const pipeline = await runAgentPipeline({
-        repoPath: taskWorktree.workspace.repoPath,
-        userPrompt: buildScopedTaskPrompt(task, run.prompt, dependencyContext, options),
-        projectTree,
-        projectMemory,
-        projectName: run.projectName,
-        writeScope: task.writeScope,
-        signal: taskSignal,
-        onProgress: onProgress ? (msg) => onProgress(`🤖 [${task.title}] ${msg}`) : undefined,
-        runId: run.id,
-        taskId: task.id,
-      });
-      architectContext = pipeline.implementerContext;
-      if (onProgress) {
-        await onProgress(
-          `📐 [${task.title}] Pipeline complete: ${pipeline.explorationReport.entryPoints.length} entry points, ${pipeline.architectPlan.fileChanges.length} planned changes`,
-        );
-      }
-    } catch (pipelineError: any) {
-      // Pipeline is non-blocking — fall back to direct implementation
-      console.warn(`[unity] Explorer/Architect pipeline failed for task ${task.id}:`, pipelineError.message);
-      if (onProgress) {
-        await onProgress(`⚠️ [${task.title}] Explorer/Architect pipeline skipped, proceeding with direct implementation.`);
-      }
-    }
-
     // Build baseline failure context so the agent doesn't waste iterations on pre-existing errors
     const failedBaselineGates = baselineStaticGates.filter((g) => g.status === 'failed');
     const baselineFailures = failedBaselineGates.length > 0
       ? failedBaselineGates.map((g) => `- ${g.name}: ${g.details.substring(0, 300)}`).join('\n')
       : null;
 
-    const execution = await generateAndWriteCode({
-      repoPath: taskWorktree.workspace.repoPath,
-      userPrompt: buildScopedTaskPrompt(task, run.prompt, dependencyContext, options),
-      figmaData,
-      projectTree,
-      projectMemory,
-      currentDiff: null,
-      learnedPatterns: learningContext.promptSection || null,
-      architectContext,
-      baselineFailures,
-      signal: taskSignal,
-      runId: run.id,
-      taskId: task.id,
-      projectName: run.projectName,
-      onStatusUpdate: (status, thought) => {
-        if (!onProgress) return;
-        return onProgress(`🧩 [${task.title}] ${status}${thought ? `\n> ${thought}` : ''}`);
-      },
-      onThinking: (iteration, reasoning) => {
-        const trimmed = reasoning.length > 2048 ? reasoning.slice(0, 2048) + '…' : reasoning;
-        unityStore.addEvent(
-          createEntityId('event'),
-          run.id,
-          task.id,
-          'info',
-          'agent.thinking',
-          `Iteration ${iteration}: ${trimmed}`,
-        );
-      },
-    });
+    const scopedPrompt = buildScopedTaskPrompt(task, run.prompt, dependencyContext, options);
+
+    let execution: ImplementationResult;
+
+    if (isA2ADelegationEnabled()) {
+      // ── A2A path: delegate implementation to the Dev Squad process ──
+      // The Explorer→Architect→Implementer pipeline runs there; core keeps the
+      // commit/scope-gate/reviewer/integrate tail below. Same result shape.
+      if (onProgress) {
+        await onProgress(`🛰️ [${task.title}] Delegating implementation to Dev Squad over A2A...`);
+      }
+      execution = await delegateImplementation({
+        repoPath: taskWorktree.workspace.repoPath,
+        userPrompt: scopedPrompt,
+        writeScope: task.writeScope,
+        projectTree,
+        projectMemory,
+        figmaData,
+        learnedPatterns: learningContext.promptSection || null,
+        baselineFailures,
+        projectName: run.projectName,
+        runId: run.id,
+        taskId: task.id,
+        onProgress: onProgress ? (msg) => onProgress(`🛰️ [${task.title}] ${msg}`) : undefined,
+      });
+    } else {
+      // ── In-process path (unchanged) ──
+      // Run Explorer → Architect pipeline for richer context
+      let architectContext: string | null = null;
+      try {
+        if (onProgress) {
+          await onProgress(`🔍 [${task.title}] Running Explorer → Architect pipeline...`);
+        }
+        const pipeline = await runAgentPipeline({
+          repoPath: taskWorktree.workspace.repoPath,
+          userPrompt: scopedPrompt,
+          projectTree,
+          projectMemory,
+          projectName: run.projectName,
+          writeScope: task.writeScope,
+          signal: taskSignal,
+          onProgress: onProgress ? (msg) => onProgress(`🤖 [${task.title}] ${msg}`) : undefined,
+          runId: run.id,
+          taskId: task.id,
+        });
+        architectContext = pipeline.implementerContext;
+        if (onProgress) {
+          await onProgress(
+            `📐 [${task.title}] Pipeline complete: ${pipeline.explorationReport.entryPoints.length} entry points, ${pipeline.architectPlan.fileChanges.length} planned changes`,
+          );
+        }
+      } catch (pipelineError: any) {
+        // Pipeline is non-blocking — fall back to direct implementation
+        console.warn(`[unity] Explorer/Architect pipeline failed for task ${task.id}:`, pipelineError.message);
+        if (onProgress) {
+          await onProgress(`⚠️ [${task.title}] Explorer/Architect pipeline skipped, proceeding with direct implementation.`);
+        }
+      }
+
+      execution = await generateAndWriteCode({
+        repoPath: taskWorktree.workspace.repoPath,
+        userPrompt: scopedPrompt,
+        figmaData,
+        projectTree,
+        projectMemory,
+        currentDiff: null,
+        learnedPatterns: learningContext.promptSection || null,
+        architectContext,
+        baselineFailures,
+        signal: taskSignal,
+        runId: run.id,
+        taskId: task.id,
+        projectName: run.projectName,
+        onStatusUpdate: (status, thought) => {
+          if (!onProgress) return;
+          return onProgress(`🧩 [${task.title}] ${status}${thought ? `\n> ${thought}` : ''}`);
+        },
+        onThinking: (iteration, reasoning) => {
+          const trimmed = reasoning.length > 2048 ? reasoning.slice(0, 2048) + '…' : reasoning;
+          unityStore.addEvent(
+            createEntityId('event'),
+            run.id,
+            task.id,
+            'info',
+            'agent.thinking',
+            `Iteration ${iteration}: ${trimmed}`,
+          );
+        },
+      });
+    }
 
     if (onProgress) {
       await onProgress(`🧩 [${task.title}] Patch accepted by scoped compiler checks. Preparing commit...`);
