@@ -3,8 +3,10 @@
 > **Goal**: make the autonomous runs reliably (1) install deps so FE+BE actually boot, and
 > (2) auto-heal runtime startup failures instead of just reporting them as warnings.
 >
-> **Status**: Design (not yet implemented). Approved scope: timeout+base-reinstall fixes,
-> FULL FE+BE healing, design-first.
+> **Status**: IMPLEMENTED across several iterations. Most pieces verified individually;
+> the full FE heal cycle is NOT yet verified end-to-end in a single run. See
+> **§16 Implementation Status & Open Items** at the bottom — that's the checklist to
+> finish later.
 > **Touches**: the core orchestrator (`run-autonomous-agent.ts`) + runtime gate files.
 
 ---
@@ -178,3 +180,61 @@ Three real issues, confirmed by reading the code:
 5. **B2 + B3 + B4** (repair tasks + heal loop) — the actual auto-healing, on top of the now-reliable gate.
 
 Ship A first (boot reliability), verify FE+BE actually run, THEN layer B (healing) on top.
+
+---
+
+## 16. Implementation Status & Open Items (as of 2026-06-16)
+
+> This section is the **resume point**. The healing work was built and iterated over several
+> real runs; the bugs found along the way are recorded here so we don't re-discover them.
+
+### ✅ Done & verified individually
+
+| Piece | Status | Evidence |
+|-------|--------|----------|
+| **A1** — FE timeout 30s→120s, tolerant `readySignals[]` | Done | `runtime-gate-config.ts` |
+| **A2** — base `npm install` when a task touched package.json | Done & seen working | run log: `node_modules restored via auto-install` |
+| **A3** — stronger `hasNodeModules` (non-empty), `CI=1` env | Done | `runtime-gate.ts` |
+| **B1** — structured classified failures (`RuntimeFailure`, `classifyFailure`) | Done & tested | classifies real font/Nest/port logs incl. ANSI + JSON-escaped quotes |
+| **B2** — `buildRuntimeRepairTasks` (failure→scoped PlanTaskDraft, `kind:'heal'`) | Done & tested | env-missing correctly NOT auto-fixed (security) |
+| **B3/B4** — heal loop, bounded, reuses `createImprovementTasks` | Done & verified reached | `run.heal_phase: canHeal=true`, `healing checks: 1` |
+| **BE healing end-to-end** | ✅ VERIFIED | run_26b357f7: `findByClub` compile error → repair task → NestJS booted clean |
+| **Bundle check via `expo export`** | ✅ VALIDATED LIVE | kubo-mobile: `expo export --platform web` exit 0 in 19s, all routes clean |
+
+### 🐛 Bugs found & fixed during verification (do NOT reintroduce)
+
+1. **Healing coupled to `maxImprovementCycles`** — user's policy has it at 0, so `0<0` killed
+   healing. Fix: dedicated `maxRuntimeHealCycles` (default 3) in `AutonomousRunPolicy` +
+   `?? 3` in `normalizePolicy` so persisted policies get it without reconfig.
+2. **Healing lived INSIDE the task `while`** — a resumed run (all tasks already done) never
+   re-entered the loop, skipping healing. Fix: moved healing to a dedicated phase AFTER the
+   task loop, wrapped both in an OUTER `while (healingPassPending)` loop so it runs always and
+   can re-enter to execute repair tasks.
+3. **HTTP bundle-probe was fundamentally broken on modern Expo** — Metro's bundle URL changed
+   across versions (Expo 54/expo-router 6 gave false 404s no matter the path:
+   `/index.bundle`, `/expo-router/entry.bundle`, virtual entry...). Fix: REPLACED HTTP probe
+   with a **command** check (`bundleCheckCommand`): Expo → `npx expo export --platform web
+   --output-dir .unity-bundle-check`; Next/Vite → `npm run build`. Runs BEFORE the dev server,
+   classifies from stdout/stderr, cleans the throwaway output dir.
+
+### 🔁 Recurring operational gotcha
+
+Editing files mid-run reloads `core` via `tsx watch` → the in-flight run is detected as
+interrupted and **resumes from crash checkpoint**, which muddied 3 separate verification runs.
+**Rule: do NOT edit files while a verification run is live.** (It is NOT caused by stuck DB
+runs — `/api/runs/resumable` was 0.)
+
+### ⏳ OPEN — finish this later
+
+1. **Verify the full FE heal cycle end-to-end in ONE clean run** (no mid-run edits): FE has a
+   real import error (e.g. the `@expo/google-fonts` scope typo) → `expo export` catches it →
+   heal loop creates a scoped repair task → agent fixes it → re-check passes → run ends
+   `completed`. All sub-pieces are proven; the joined cycle is not yet observed.
+2. **Remove the temporary diagnostic events** `run.exec_enter` and `run.heal_phase` from
+   `run-autonomous-agent.ts` once #1 is confirmed.
+3. **Decide healing scope for FE vs BE precedence** — current gate starts backends first; if
+   both fail, only the first failure is returned per gate run (healing iterates, so it gets to
+   the FE on the next round, but confirm this multi-failure sequencing behaves under budget).
+4. **Watch the runtime-gate process cleanup** — observed `:3000`/`:8081` left alive after a
+   run (services not always killed on close). Not fatal (killPort handles next run) but worth
+   tightening so stray dev servers don't accumulate.

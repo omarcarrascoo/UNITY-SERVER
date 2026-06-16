@@ -18,6 +18,8 @@ import { getLearningStore } from '../../services/learning/learning-store.js';
 import { getKnowledgeGraph } from '../../services/knowledge/index.js';
 import { handleGitHubWebhook } from '../webhooks/index.js';
 import { normalizePolicy, getProjectPolicy } from '../../services/orchestration/policy-engine.js';
+import { createPullRequestFromBranch, resolveWorkspace } from '../../git.js';
+import { runProjectRuntimeGate } from '../../services/orchestration/runtime-gate.js';
 
 type RunPayload = NonNullable<ReturnType<typeof buildRunPayload>>;
 
@@ -542,7 +544,7 @@ function recordPairSession(sessionId: string, projectName: string, prompt: strin
   return record;
 }
 
-function listAvailableProjects(): Array<{ name: string; repoPath: string; hasGit: boolean }> {
+function listAvailableProjects(): Array<{ name: string; repoPath: string; hasGit: boolean; hasDeploy: boolean }> {
   try {
     if (!fs.existsSync(WORKSPACE_DIR)) return [];
     const entries = fs.readdirSync(WORKSPACE_DIR, { withFileTypes: true });
@@ -554,6 +556,7 @@ function listAvailableProjects(): Array<{ name: string; repoPath: string; hasGit
           name: entry.name,
           repoPath,
           hasGit: fs.existsSync(path.join(repoPath, '.git')),
+          hasDeploy: fs.existsSync(path.join(repoPath, '.unity', 'deploy.json')),
         };
       })
       .filter((p) => p.hasGit)
@@ -615,12 +618,16 @@ function buildActionsHtml(run: UiRunViewModel['run'], plan: UiRunViewModel['plan
     return `<div class="actions">
       <button class="btn-secondary" id="rerun-failed" type="button">Re-run Failed Tasks</button>
       <button class="btn-secondary" id="view-diff" type="button">View Diff</button>
+      <button class="btn-primary" id="create-pr" type="button">Create PR</button>
+      <button class="btn-secondary" id="run-local" type="button">▶ Run Locally</button>
     </div>`;
   }
 
   if (run.status === 'completed') {
     return `<div class="actions">
       <button class="btn-secondary" id="view-diff" type="button">View Diff</button>
+      <button class="btn-primary" id="create-pr" type="button">Create PR</button>
+      <button class="btn-secondary" id="run-local" type="button">▶ Run Locally</button>
     </div>`;
   }
 
@@ -1191,16 +1198,33 @@ function buildHomePageShell(): string {
         nightly: 'Jarvis will plan AND execute without asking. Good for well-scoped work where you trust the outcome.',
         pair: 'Single code iteration: one diff, one snapshot, no planner. Same behavior as the Discord #jarvis-dev channel.',
       };
+      var ACTIVE_PROJECT_KEY = 'unity.activeProject';
+      var projectsCache = [];
       async function loadProjects(){
         try {
           var r = await fetch('/api/projects');
           var projects = await r.json();
+          projectsCache = projects;
           var sel = document.getElementById('launch-project');
           if (!projects.length) {
             sel.innerHTML = '<option value="">No projects found in workspaces/</option>';
             return;
           }
-          sel.innerHTML = projects.map(function(p){return '<option value="'+safe(p.name)+'">'+safe(p.name)+'</option>';}).join('');
+          // Mark which projects have a deploy config so the UI can hint it.
+          sel.innerHTML = projects.map(function(p){
+            return '<option value="'+safe(p.name)+'">'+safe(p.name)+(p.hasDeploy?' · 🚀 deploy ready':'')+'</option>';
+          }).join('');
+          // Restore the last-used "active project" so the panel remembers context.
+          var saved = '';
+          try { saved = localStorage.getItem(ACTIVE_PROJECT_KEY) || ''; } catch(e){}
+          if (saved && projects.some(function(p){return p.name===saved;})) {
+            sel.value = saved;
+          }
+          sel.onchange = function(){
+            try { localStorage.setItem(ACTIVE_PROJECT_KEY, sel.value); } catch(e){}
+          };
+          // Persist initial selection too.
+          try { if (sel.value) localStorage.setItem(ACTIVE_PROJECT_KEY, sel.value); } catch(e){}
         } catch(e) {
           console.error('Failed to load projects', e);
         }
@@ -1768,6 +1792,10 @@ function renderRunPage(
           actHtml = \`<button class="btn-primary" id="approve-plan" type="button">Approve Plan</button> <button class="btn-danger" id="reject-plan" type="button">Reject</button>\`;
         } else if (run.status === 'running' || run.status === 'healing') {
           actHtml = \`<button class="btn-secondary" id="cancel-run" type="button">Cancel Run</button>\`;
+        } else if (run.status === 'failed' || run.status === 'completed_with_warnings') {
+          actHtml = \`<button class="btn-secondary" id="rerun-failed" type="button">Re-run Failed Tasks</button> <button class="btn-secondary" id="view-diff" type="button">View Diff</button> <button class="btn-primary" id="create-pr" type="button">Create PR</button> <button class="btn-secondary" id="run-local" type="button">▶ Run Locally</button>\`;
+        } else if (run.status === 'completed') {
+          actHtml = \`<button class="btn-secondary" id="view-diff" type="button">View Diff</button> <button class="btn-primary" id="create-pr" type="button">Create PR</button> <button class="btn-secondary" id="run-local" type="button">▶ Run Locally</button>\`;
         }
         actions.innerHTML = actHtml;
 
@@ -1803,6 +1831,34 @@ function renderRunPage(
           headers:{'Content-Type':'application/json'},
           body: JSON.stringify({})
         }));
+
+        const prBtn = document.getElementById('create-pr');
+        if(prBtn) prBtn.onclick = async () => {
+          prBtn.disabled = true;
+          const original = prBtn.textContent;
+          prBtn.textContent = 'Opening PR...';
+          try {
+            const r = await fetch('/api/runs/'+currentRunId+'/create-pr', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+            const data = await r.json();
+            if (r.ok && data.prUrl) { prBtn.textContent = 'PR Opened ✓'; window.open(data.prUrl, '_blank'); }
+            else { prBtn.textContent = original; alert('PR failed: ' + (data.error || 'unknown error')); }
+          } catch(e) { prBtn.textContent = original; alert('PR request failed.'); }
+          await loadRunData();
+        };
+
+        const runLocalBtn = document.getElementById('run-local');
+        if(runLocalBtn) runLocalBtn.onclick = async () => {
+          runLocalBtn.disabled = true;
+          const original = runLocalBtn.textContent;
+          runLocalBtn.textContent = 'Starting (FE+BE)...';
+          try {
+            const r = await fetch('/api/runs/'+currentRunId+'/run-local', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+            const data = await r.json();
+            if (r.ok) { runLocalBtn.textContent = 'Starting — watch events for URL'; }
+            else { runLocalBtn.textContent = original; runLocalBtn.disabled = false; alert('Failed to start: ' + (data.error || 'unknown error')); }
+          } catch(e) { runLocalBtn.textContent = original; runLocalBtn.disabled = false; alert('Run-local request failed.'); }
+          await loadRunData();
+        };
 
         const diffBtn = document.getElementById('view-diff');
         if(diffBtn) diffBtn.onclick = async () => {
@@ -2952,6 +3008,79 @@ export function startUnityHttpServer(runtime: RuntimeState) {
         }
 
         sendJson(res, 202, { ok: true, message: 'Abort requested.' });
+        return;
+      }
+
+      /* ── Close-the-loop: open a PR for a run's integration branch ── */
+      if (req.method === 'POST' && extractRunId(pathname, '/create-pr')) {
+        const runId = extractRunId(pathname, '/create-pr') as string;
+        const run = unityStore.getRun(runId);
+        if (!run) {
+          sendJson(res, 404, { error: `Run ${runId} not found.` });
+          return;
+        }
+        try {
+          const project = getProjectByName(run.projectName);
+          const title = `✨ ${truncate(run.prompt, 70)}`;
+          const body = [
+            `Autonomous run \`${runId}\` on \`${run.branchName}\`.`,
+            '',
+            `**Objective:** ${run.prompt}`,
+            '',
+            run.summary ? `**Summary:**\n${run.summary}` : '',
+          ].join('\n');
+          const prUrl = await createPullRequestFromBranch(
+            run.projectName,
+            project.repoPath,
+            run.branchName,
+            title,
+            body,
+          );
+          unityStore.addEvent(createEntityId('event'), runId, null, 'info', 'run.pr_created', `PR opened: ${prUrl}`);
+          sendJson(res, 201, { ok: true, prUrl });
+        } catch (err: any) {
+          sendJson(res, 500, { error: err?.message || 'Failed to open PR.' });
+        }
+        return;
+      }
+
+      /* ── Run the project LOCALLY so you can see it (FE + BE up, URLs returned) ── */
+      if (req.method === 'POST' && extractRunId(pathname, '/run-local')) {
+        const runId = extractRunId(pathname, '/run-local') as string;
+        const run = unityStore.getRun(runId);
+        if (!run) {
+          sendJson(res, 404, { error: `Run ${runId} not found.` });
+          return;
+        }
+        const project = getProjectByName(run.projectName);
+        // Reuse the runtime gate: it starts backends+frontends, links the backend
+        // URL into the frontend, and leaves the processes RUNNING (cleanup only
+        // happens at the start of the next gate run), so you can open the URLs.
+        unityStore.addEvent(createEntityId('event'), runId, null, 'info', 'run.local_start', 'Starting project locally from panel...');
+        void resolveWorkspace(project)
+          .then((workspace) =>
+            runProjectRuntimeGate(workspace, '/', (m) => {
+              console.log(`[run-local][${runId}] ${m}`);
+              unityStore.addEvent(createEntityId('event'), runId, null, 'info', 'run.local_progress', m);
+            }),
+          )
+          .then((result) => {
+            unityStore.addEvent(
+              createEntityId('event'),
+              runId,
+              null,
+              result.status === 'passed' ? 'info' : 'error',
+              result.status === 'passed' ? 'run.local_ready' : 'run.local_failed',
+              result.status === 'passed'
+                ? `Project running locally. ${result.localUrl ? 'Local: ' + result.localUrl : ''}${result.publicUrl ? ' | Wi-Fi: ' + result.publicUrl : ''}`
+                : `Could not start locally: ${result.details}`,
+              { localUrl: result.localUrl, publicUrl: result.publicUrl },
+            );
+          })
+          .catch((err) => {
+            unityStore.addEvent(createEntityId('event'), runId, null, 'error', 'run.local_failed', err?.message || String(err));
+          });
+        sendJson(res, 202, { ok: true, message: 'Starting project locally. Watch the run events for the URL.' });
         return;
       }
 

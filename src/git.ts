@@ -264,6 +264,60 @@ export async function createPullRequest(
   }
 }
 
+/**
+ * Open a PR from an ALREADY-PUSHED branch (the autonomous-run case) toward the
+ * base branch. Unlike `createPullRequest`, this does not commit/push — an
+ * autonomous run already commits + pushes to its integration branch during
+ * execution. This just ensures the branch is on the remote and opens the PR.
+ *
+ * Returns the PR URL, or the existing PR URL if one is already open for the head.
+ */
+export async function createPullRequestFromBranch(
+  repoName: string,
+  repoPath: string,
+  branchName: string,
+  title: string,
+  body: string,
+): Promise<string> {
+  const config = getRuntimeConfig();
+  const base = getBaseBranch();
+
+  // Make sure the branch is on the remote (no-op if already pushed).
+  await execFilePromise('git', ['push', '-u', 'origin', branchName], { cwd: repoPath }).catch(() => {});
+
+  const apiBase = `https://api.github.com/repos/${config.githubOwner}/${repoName}`;
+  const headers = {
+    Authorization: `Bearer ${config.githubToken}`,
+    Accept: 'application/vnd.github.v3+json',
+    'Content-Type': 'application/json',
+  };
+
+  const prResponse = await fetch(`${apiBase}/pulls`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ title, body, head: branchName, base }),
+  });
+
+  if (prResponse.ok) {
+    return (await prResponse.json()).html_url as string;
+  }
+
+  // A PR for this head may already exist — return it instead of failing.
+  const errText = await prResponse.text();
+  if (/pull request already exists/i.test(errText)) {
+    const existing = await fetch(
+      `${apiBase}/pulls?head=${config.githubOwner}:${branchName}&state=open`,
+      { headers },
+    );
+    if (existing.ok) {
+      const list = (await existing.json()) as Array<{ html_url: string }>;
+      if (list.length) return list[0].html_url;
+    }
+  }
+
+  throw new Error(`Failed to open PR: ${errText}`);
+}
+
 export async function scaffoldProject(type: string, name: string, workspaceDir: string): Promise<void> {
   if (!fs.existsSync(workspaceDir)) {
     fs.mkdirSync(workspaceDir, { recursive: true });

@@ -36,13 +36,14 @@ export interface RuntimeServiceConfig {
   /** Environment variables to inject before starting */
   env?: Record<string, string>;
   /**
-   * Optional bundle-probe URL path. After the ready signal, the gate fetches
-   * this to FORCE a real bundle (catches errors that only surface at bundling
-   * time, e.g. "Unable to resolve module"). A non-2xx or Metro error body fails
-   * the service. Crucial for Expo/Metro web: the dev server signals "ready"
-   * BEFORE bundling, so the ready signal alone never catches import errors.
+   * Optional bundle-verification COMMAND run BEFORE starting the dev server
+   * (e.g. `npx expo export --platform web`). This is the official, robust way to
+   * surface bundling errors ("Unable to resolve module", compile errors) that a
+   * dev server hides until first request — and it doesn't depend on guessing the
+   * Metro bundle URL (which changes across Expo versions). Non-zero exit OR a
+   * Metro error signature in the output fails the service with a classified error.
    */
-  bundleProbePath?: string;
+  bundleCheckCommand?: string;
 }
 
 /** Frontend services get a longer window — JS bundling of a real app is slow. */
@@ -102,7 +103,7 @@ function loadManualConfig(repoPath: string): RuntimeGateManifest | null {
           requiresNodeModules: s.requiresNodeModules !== false,
           type,
           env: s.env,
-          bundleProbePath: s.bundleProbePath || s.bundle_probe_path,
+          bundleCheckCommand: s.bundleCheckCommand || s.bundle_check_command,
         };
       }),
       linkBackendToFrontend: raw.linkBackendToFrontend ?? raw.link_backend_to_frontend ?? false,
@@ -131,22 +132,6 @@ function hasExpoApp(dir: string): boolean {
   return Boolean(pkg?.dependencies?.expo || pkg?.devDependencies?.expo);
 }
 
-/**
- * Derive the Metro web bundle URL from the app's entry point.
- *
- * Metro serves `/<entry>.bundle`. The entry is the package.json `main`, minus
- * any extension. Classic Expo uses `index` (or `node_modules/expo/AppEntry`),
- * but expo-router apps use `expo-router/entry` — hardcoding `/index.bundle`
- * 404s on router apps. We read `main` so the probe matches the real entry.
- */
-function getExpoBundleProbePath(dir: string): string {
-  const pkg = readPackageJson(dir);
-  let main = typeof pkg?.main === 'string' ? pkg.main : 'index';
-  // Strip a leading ./ and any JS extension; Metro wants the bare module path.
-  main = main.replace(/^\.\//, '').replace(/\.(js|jsx|ts|tsx)$/, '');
-  if (!main) main = 'index';
-  return `/${main}.bundle?platform=web&dev=true`;
-}
 
 function hasNestApp(dir: string): boolean {
   const pkg = readPackageJson(dir);
@@ -232,9 +217,9 @@ function autoDetectServices(
       timeoutMs: FRONTEND_TIMEOUT_MS,
       requiresNodeModules: true,
       type: 'frontend',
-      // Force a real web bundle so import/resolve errors actually surface.
-      // Path derived from package.json `main` (expo-router uses expo-router/entry).
-      bundleProbePath: getExpoBundleProbePath(expoPath),
+      // Verify the web bundle compiles via the official export command — surfaces
+      // "Unable to resolve module"/compile errors without guessing the Metro URL.
+      bundleCheckCommand: 'npx expo export --platform web --output-dir .unity-bundle-check',
     });
   } else if (hasNextApp(expoPath)) {
     services.push({
@@ -246,7 +231,7 @@ function autoDetectServices(
       timeoutMs: FRONTEND_TIMEOUT_MS,
       requiresNodeModules: true,
       type: 'frontend',
-      bundleProbePath: '/',
+      bundleCheckCommand: 'npm run build',
     });
   } else if (hasViteApp(expoPath)) {
     services.push({
@@ -258,7 +243,7 @@ function autoDetectServices(
       timeoutMs: FRONTEND_TIMEOUT_MS,
       requiresNodeModules: true,
       type: 'frontend',
-      bundleProbePath: '/',
+      bundleCheckCommand: 'npm run build',
     });
   }
 

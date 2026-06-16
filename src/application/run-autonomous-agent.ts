@@ -1078,6 +1078,16 @@ async function executeApprovedRun(
   signal?: AbortSignal,
   onProgress?: (message: string) => Promise<void>,
 ): Promise<RunAutonomousAgentResult> {
+  // DIAGNOSTIC (temporary): confirm the run reaches the main execution function.
+  unityStore.addEvent(
+    createEntityId('event'),
+    run.id,
+    null,
+    'info',
+    'run.exec_enter',
+    `executeApprovedRun entered. status=${run.status} existingTasks=${unityStore.listTasksByRun(run.id).length}`,
+  );
+
   const figmaData = await getFigmaContext(run.prompt);
   const projectMemory = getProjectMemory(baseWorkspace.repoPath);
   const existingTasks = unityStore.listTasksByRun(run.id);
@@ -1097,11 +1107,17 @@ async function executeApprovedRun(
   let pendingImprovementDrafts: PlanTaskDraft[] = [];
   let latestTargetRoute = '/';
   let budgetNote: string | null = null;
-  // Runtime auto-healing state: cache the last in-loop runtime gate result so the
-  // closure can reuse it instead of running the gate a second time.
+  // Runtime auto-healing state. The healing phase runs AFTER the task loop (so a
+  // resumed run with all tasks already done still reaches it); if it spawns repair
+  // tasks it flips `healingPassPending` and we re-enter the whole task loop.
   let runtimeResultsFromHealing: GateResult[] | null = null;
   let runtimeHealCycles = 0;
   let depsTouchedDuringRun = false;
+  let healingPassPending = true; // run the healing phase at least once
+
+  // Outer loop: task loop → healing phase → (maybe) repair tasks → repeat.
+  while (healingPassPending) {
+    healingPassPending = false;
 
   while (commitsCreated < policy.maxCommits) {
     if (signal?.aborted) {
@@ -1186,78 +1202,9 @@ async function executeApprovedRun(
         continue;
       }
 
-      // ── Runtime auto-healing (Part B) ──
-      // All planned + reviewer-improvement work is done. Boot the app; if it fails
-      // with something fixable and we still have cycle/commit/time budget, spawn
-      // scoped repair tasks and re-enter THIS loop to run them, then re-check.
-      // Runtime healing has its OWN budget (maxRuntimeHealCycles), independent of
-      // maxImprovementCycles — booting the app is not the same as polishing code.
-      const canHealMore =
-        !gracefulDrainRequested &&
-        commitsCreated < policy.maxCommits &&
-        runtimeHealCycles < policy.maxRuntimeHealCycles;
-
-      if (canHealMore) {
-        await checkoutBranch(baseWorkspace.repoPath, run.branchName);
-
-        // If a task changed dependencies, the base node_modules (symlinked into
-        // worktrees) may be stale — refresh before booting (Part A2).
-        if (depsTouchedDuringRun) {
-          await refreshWorkspaceDependencies(baseWorkspace, (m) => {
-            if (onProgress) void onProgress(m);
-          });
-          depsTouchedDuringRun = false;
-        }
-
-        if (onProgress) {
-          await onProgress(`🌐 Runtime healing check ${runtimeHealCycles + 1}: booting app to verify it runs...`);
-        }
-
-        const detailed = await runRuntimeGateDetailed(baseWorkspace, policy, latestTargetRoute, onProgress);
-        runtimeResultsFromHealing = detailed.results;
-        runtimeHealCycles += 1;
-
-        const runtimePassed = detailed.results.every((g) => g.status !== 'failed');
-        if (runtimePassed) {
-          break; // app boots — done
-        }
-
-        if (hasHealableFailures(detailed.failures)) {
-          const repairDrafts = buildRuntimeRepairTasks(detailed.failures);
-          unityStore.updateRun(run.id, { status: 'healing' });
-          // Label repair tasks by heal round (NOT improvementCycle — separate budget).
-          const repairTasks = createImprovementTasks(
-            run.id,
-            runtimeHealCycles,
-            dedupeFollowUpTasks(repairDrafts),
-            allTasks.length,
-          );
-          for (const task of repairTasks) {
-            unityStore.createTask(task);
-          }
-          unityStore.addEvent(
-            createEntityId('event'),
-            run.id,
-            null,
-            'warning',
-            'run.runtime_healing',
-            `Runtime gate failed; created ${repairTasks.length} repair task(s).`,
-            { failures: detailed.failures.map((f) => ({ kind: f.kind, detail: f.detail })) },
-          );
-          if (onProgress) {
-            await onProgress(
-              `🩹 Runtime failed to boot — created ${repairTasks.length} repair task(s) and retrying. (${detailed.failures.map((f) => f.detail).join('; ')})`,
-            );
-          }
-          continue; // re-enter loop to run repair tasks, then re-check
-        }
-
-        // Runtime failed but nothing is safely auto-fixable — stop healing.
-        if (onProgress) {
-          await onProgress(`⚠️ Runtime gate failed with no auto-fixable cause; leaving as a warning.`);
-        }
-      }
-
+      // No more ready tasks and no improvement drafts: the task loop is done.
+      // Runtime healing happens in a DEDICATED phase after this loop (see below),
+      // so it runs regardless of how the loop ended (normal, resume, or drain).
       break;
     }
 
@@ -1428,6 +1375,85 @@ async function executeApprovedRun(
       break;
     }
   }
+
+  // ── Runtime auto-healing phase (Part B) ──
+  // Runs after the task loop ALWAYS — including resumed runs where every task was
+  // already done (the task loop wouldn't iterate). Boot the app; if it fails with
+  // something fixable and budget remains, spawn scoped repair tasks and flip
+  // `healingPassPending` so the OUTER loop re-runs the task loop to execute them.
+  // Own budget (maxRuntimeHealCycles), independent of maxImprovementCycles.
+  const canHeal =
+    !gracefulDrainRequested &&
+    commitsCreated < policy.maxCommits &&
+    runtimeHealCycles < policy.maxRuntimeHealCycles;
+
+  // DIAGNOSTIC (temporary): confirm the healing phase is reached and why it gates.
+  unityStore.addEvent(
+    createEntityId('event'),
+    run.id,
+    null,
+    'info',
+    'run.heal_phase',
+    `reached healing phase: canHeal=${canHeal} drain=${gracefulDrainRequested} commits=${commitsCreated}/${policy.maxCommits} healCycles=${runtimeHealCycles}/${policy.maxRuntimeHealCycles}`,
+  );
+
+  if (canHeal) {
+    await checkoutBranch(baseWorkspace.repoPath, run.branchName);
+
+    // If a task changed dependencies, the base node_modules (symlinked into
+    // worktrees) may be stale — refresh before booting (Part A2).
+    if (depsTouchedDuringRun) {
+      await refreshWorkspaceDependencies(baseWorkspace, (m) => {
+        if (onProgress) void onProgress(m);
+      });
+      depsTouchedDuringRun = false;
+    }
+
+    if (onProgress) {
+      await onProgress(`🌐 Runtime healing check ${runtimeHealCycles + 1}: booting app to verify it runs...`);
+    }
+
+    const detailed = await runRuntimeGateDetailed(baseWorkspace, policy, latestTargetRoute, onProgress);
+    runtimeResultsFromHealing = detailed.results;
+    runtimeHealCycles += 1;
+
+    const runtimePassed = detailed.results.every((g) => g.status !== 'failed');
+
+    if (!runtimePassed && hasHealableFailures(detailed.failures)) {
+      const repairDrafts = buildRuntimeRepairTasks(detailed.failures);
+      const existingCount = unityStore.listTasksByRun(run.id).length;
+      unityStore.updateRun(run.id, { status: 'healing' });
+      const repairTasks = createImprovementTasks(
+        run.id,
+        runtimeHealCycles,
+        dedupeFollowUpTasks(repairDrafts),
+        existingCount,
+      );
+      for (const task of repairTasks) {
+        unityStore.createTask(task);
+      }
+      unityStore.addEvent(
+        createEntityId('event'),
+        run.id,
+        null,
+        'warning',
+        'run.runtime_healing',
+        `Runtime gate failed; created ${repairTasks.length} repair task(s).`,
+        { failures: detailed.failures.map((f) => ({ kind: f.kind, detail: f.detail })) },
+      );
+      if (onProgress) {
+        await onProgress(
+          `🩹 Runtime failed to boot — created ${repairTasks.length} repair task(s) and retrying. (${detailed.failures.map((f) => f.detail).join('; ')})`,
+        );
+      }
+      runtimeResultsFromHealing = null; // will re-run the gate after repairs
+      healingPassPending = true; // re-enter the outer loop to run repair tasks
+    } else if (!runtimePassed && onProgress) {
+      await onProgress(`⚠️ Runtime gate failed with no auto-fixable cause; leaving as a warning.`);
+    }
+  }
+
+  } // end outer healing loop
 
   const endBudgetState = getRunBudgetState(deadline);
   const pendingTasksAfterLoop = unityStore

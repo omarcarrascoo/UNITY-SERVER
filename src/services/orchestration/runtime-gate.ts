@@ -249,8 +249,8 @@ interface StartSuccess {
 
 /**
  * Start a single service: ensure deps, wait for ANY ready signal, then (for
- * services with a bundleProbePath) force a real bundle to surface import/compile
- * errors that the dev server hides until first request.
+ * services with a bundleCheckCommand) compile the bundle first to surface
+ * import/compile errors that the dev server hides until first request.
  */
 async function startService(
   service: RuntimeServiceConfig,
@@ -260,6 +260,14 @@ async function startService(
   if (!nodeModulesCheck.ok) {
     await emitRuntimeLog(onLog, `❌ [runtime:${service.name}] ${nodeModulesCheck.error}`);
     return { failure: classifyFailure(service.name, nodeModulesCheck.error, 'prereq-missing') };
+  }
+
+  // ── Bundle verification (B1): compile the bundle BEFORE starting the dev server.
+  // This surfaces "Unable to resolve"/compile errors deterministically, without
+  // depending on the dev server or guessing the Metro bundle URL.
+  if (service.bundleCheckCommand) {
+    const bundleFailure = await runBundleCheck(service, onLog);
+    if (bundleFailure) return { failure: bundleFailure };
   }
 
   await killPort(service.port);
@@ -308,68 +316,57 @@ async function startService(
     return { failure: classifyFailure(service.name, `${detail}\n${serviceLog}`, kindHint) };
   }
 
-  // ── A3/B1: force a real bundle so import/compile errors actually surface ──
-  if (service.bundleProbePath) {
-    const probe = await probeBundle(service, onLog);
-    if (probe) {
-      // Keep the process around for cleanup; report the structured failure.
-      return { failure: probe };
-    }
-  }
-
   await emitRuntimeLog(onLog, `✅ [runtime:${service.name}] Ready on port ${service.port}.`);
   return { proc, log: serviceLog };
 }
 
 /**
- * Fetch the bundle probe URL to force bundling. Returns a RuntimeFailure if the
- * bundle errors, or null if it bundled cleanly. Metro returns a JS error payload
- * (often HTTP 500) whose body contains "Unable to resolve ...".
+ * Run the bundle-check command (e.g. `npx expo export`) to compile the bundle and
+ * surface errors deterministically. Returns a classified RuntimeFailure if the
+ * command fails or its output has a Metro/compiler error signature, else null.
+ *
+ * This replaces the old HTTP "probe" approach, which was fragile: the Metro
+ * bundle URL changed across Expo versions (index.bundle vs expo-router/entry vs
+ * a virtual entry), causing false 404s. `expo export` is the official way.
  */
-async function probeBundle(
+const BUNDLE_ERROR_SIGNATURE =
+  /Unable to resolve|Cannot find module|UnableToResolveError|error TS\d+|SyntaxError|Failed to compile|Metro encountered an error|Cannot resolve/i;
+
+async function runBundleCheck(
   service: RuntimeServiceConfig,
   onLog?: RuntimeLogFn,
 ): Promise<RuntimeFailure | null> {
-  const url = `http://127.0.0.1:${service.port}${service.bundleProbePath}`;
-  await emitRuntimeLog(onLog, `🧪 [runtime:${service.name}] Probing bundle: ${url}`);
+  const cmd = service.bundleCheckCommand!;
+  await emitRuntimeLog(onLog, `🧪 [runtime:${service.name}] Verifying bundle: \`${cmd}\` (this can take a while)...`);
 
   try {
-    // Bundling a real app can take a while; give it up to 90s.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 90_000);
-    const res = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
-    const body = await res.text();
-
-    // A real bundling error has a Metro/compiler signature in the body, regardless
-    // of status code (Metro often returns 500 with the error JSON).
-    const hasErrorSignature =
-      /Unable to resolve|Cannot find module|UnableToResolveError|error TS\d+|SyntaxError|Failed to compile|Metro encountered an error/i.test(
-        body.slice(0, 4000),
-      );
-
-    if (hasErrorSignature) {
-      await emitRuntimeLog(onLog, `❌ [runtime:${service.name}] Bundle probe failed (HTTP ${res.status}).`);
-      return classifyFailure(service.name, body);
+    const { stdout, stderr } = await execPromise(cmd, {
+      cwd: service.cwd,
+      timeout: 240_000,
+      maxBuffer: 50 * 1024 * 1024,
+      env: { ...process.env, ...service.env, CI: '1' },
+    });
+    const out = `${stdout}\n${stderr}`;
+    // Some tools exit 0 but still print resolution errors — check the output too.
+    if (BUNDLE_ERROR_SIGNATURE.test(out)) {
+      await emitRuntimeLog(onLog, `❌ [runtime:${service.name}] Bundle check reported errors.`);
+      return classifyFailure(service.name, out);
     }
-
-    // 4xx WITHOUT an error signature = wrong probe path (not a broken app). Don't
-    // fail the gate on our own mistaken URL — log and treat the service as up.
-    if (!res.ok) {
-      await emitRuntimeLog(
-        onLog,
-        `⚠️ [runtime:${service.name}] Bundle probe returned HTTP ${res.status} with no error signature (likely a probe-path mismatch, not an app error). Treating service as started.`,
-      );
-      return null;
-    }
-
-    await emitRuntimeLog(onLog, `✅ [runtime:${service.name}] Bundle probe OK (HTTP ${res.status}).`);
+    await emitRuntimeLog(onLog, `✅ [runtime:${service.name}] Bundle compiled cleanly.`);
     return null;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    // A probe transport error is not necessarily a bundle error — report as unknown
-    // but don't crash the gate.
-    await emitRuntimeLog(onLog, `⚠️ [runtime:${service.name}] Bundle probe could not complete: ${message}`);
-    return classifyFailure(service.name, `Bundle probe error: ${message}`, 'unknown');
+  } catch (err: any) {
+    // Non-zero exit: stdout/stderr carry the real error (e.g. "Unable to resolve").
+    const out = `${err?.stdout || ''}\n${err?.stderr || ''}\n${err?.message || ''}`;
+    await emitRuntimeLog(onLog, `❌ [runtime:${service.name}] Bundle check failed (exit ${err?.code ?? '?'}).`);
+    return classifyFailure(service.name, out);
+  } finally {
+    // Clean the throwaway export output so it never lands in a commit/diff.
+    try {
+      const outDir = path.join(service.cwd, '.unity-bundle-check');
+      if (fs.existsSync(outDir)) fs.rmSync(outDir, { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup
+    }
   }
 }
 
