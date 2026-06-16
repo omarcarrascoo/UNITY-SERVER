@@ -130,6 +130,31 @@ async function installWorkspaceDependencies(basePath: string, targets: Workspace
   }
 }
 
+/**
+ * Reinstall dependencies in an already-prepared workspace's package dirs.
+ *
+ * Used before the final runtime gate when a task added/changed a dependency:
+ * task worktrees symlink the base node_modules, so a newly-added package never
+ * reaches the base unless we reinstall here. Cheap to call; npm is a no-op when
+ * nothing changed. Failures are logged, not thrown (the gate will surface them).
+ */
+export async function refreshWorkspaceDependencies(
+  workspace: PreparedWorkspace,
+  onLog?: (message: string) => void,
+): Promise<void> {
+  const dirs = workspace.packageDirs.length ? workspace.packageDirs : [workspace.repoPath];
+  for (const packageDir of dirs) {
+    if (!fs.existsSync(path.join(packageDir, 'package.json'))) continue;
+    removeInvalidNodeModulesIfNeeded(packageDir);
+    onLog?.(`📦 Refreshing dependencies in ${path.basename(packageDir)}...`);
+    try {
+      await execPromise('npm install', { cwd: packageDir, timeout: 300_000 });
+    } catch (err) {
+      onLog?.(`⚠️ Dependency refresh failed in ${packageDir}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
 export async function resolveWorkspace(project: WorkspaceProject): Promise<PreparedWorkspace> {
   if (!fs.existsSync(project.repoPath)) {
     throw new Error(`Workspace for project "${project.name}" does not exist locally.`);

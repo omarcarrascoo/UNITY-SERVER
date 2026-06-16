@@ -18,8 +18,11 @@ export interface RuntimeServiceConfig {
   cwd: string;
   /** Command to start the service */
   startCommand: string;
-  /** String or regex pattern in stdout/stderr that signals readiness */
-  readySignal: string;
+  /**
+   * Substring(s) in stdout/stderr that signal readiness. ANY match counts.
+   * Multiple patterns make detection robust across tool-version output changes.
+   */
+  readySignals: string[];
   /** Port the service listens on */
   port: number;
   /** Optional health check URL to verify after readySignal */
@@ -32,7 +35,18 @@ export interface RuntimeServiceConfig {
   type: 'frontend' | 'backend' | 'generic';
   /** Environment variables to inject before starting */
   env?: Record<string, string>;
+  /**
+   * Optional bundle-probe URL path. After the ready signal, the gate fetches
+   * this to FORCE a real bundle (catches errors that only surface at bundling
+   * time, e.g. "Unable to resolve module"). A non-2xx or Metro error body fails
+   * the service. Crucial for Expo/Metro web: the dev server signals "ready"
+   * BEFORE bundling, so the ready signal alone never catches import errors.
+   */
+  bundleProbePath?: string;
 }
+
+/** Frontend services get a longer window — JS bundling of a real app is slow. */
+const FRONTEND_TIMEOUT_MS = 120_000;
 
 export interface RuntimeGateManifest {
   /** Services to start, in order (backends first, frontends second) */
@@ -69,18 +83,28 @@ function loadManualConfig(repoPath: string): RuntimeGateManifest | null {
     if (!raw.services || !Array.isArray(raw.services)) return null;
 
     return {
-      services: raw.services.map((s: any) => ({
-        name: s.name || 'service',
-        cwd: s.cwd || '.',
-        startCommand: s.startCommand || s.start_command || 'npm start',
-        readySignal: s.readySignal || s.ready_signal || 'listening',
-        port: Number(s.port) || 3000,
-        healthCheck: s.healthCheck || s.health_check,
-        timeoutMs: Number(s.timeoutMs || s.timeout_ms) || DEFAULT_TIMEOUT_MS,
-        requiresNodeModules: s.requiresNodeModules !== false,
-        type: s.type || 'generic',
-        env: s.env,
-      })),
+      services: raw.services.map((s: any) => {
+        const type = s.type || 'generic';
+        // Accept readySignals[] (new), readySignal (legacy single), or default.
+        const signals: string[] = Array.isArray(s.readySignals)
+          ? s.readySignals
+          : [s.readySignal || s.ready_signal || 'listening'];
+        return {
+          name: s.name || 'service',
+          cwd: s.cwd || '.',
+          startCommand: s.startCommand || s.start_command || 'npm start',
+          readySignals: signals,
+          port: Number(s.port) || 3000,
+          healthCheck: s.healthCheck || s.health_check,
+          timeoutMs:
+            Number(s.timeoutMs || s.timeout_ms) ||
+            (type === 'frontend' ? FRONTEND_TIMEOUT_MS : DEFAULT_TIMEOUT_MS),
+          requiresNodeModules: s.requiresNodeModules !== false,
+          type,
+          env: s.env,
+          bundleProbePath: s.bundleProbePath || s.bundle_probe_path,
+        };
+      }),
       linkBackendToFrontend: raw.linkBackendToFrontend ?? raw.link_backend_to_frontend ?? false,
       backendUrlEnvVar: raw.backendUrlEnvVar || raw.backend_url_env_var || 'EXPO_PUBLIC_API_URL',
     };
@@ -105,6 +129,23 @@ function readPackageJson(dir: string): Record<string, any> | null {
 function hasExpoApp(dir: string): boolean {
   const pkg = readPackageJson(dir);
   return Boolean(pkg?.dependencies?.expo || pkg?.devDependencies?.expo);
+}
+
+/**
+ * Derive the Metro web bundle URL from the app's entry point.
+ *
+ * Metro serves `/<entry>.bundle`. The entry is the package.json `main`, minus
+ * any extension. Classic Expo uses `index` (or `node_modules/expo/AppEntry`),
+ * but expo-router apps use `expo-router/entry` — hardcoding `/index.bundle`
+ * 404s on router apps. We read `main` so the probe matches the real entry.
+ */
+function getExpoBundleProbePath(dir: string): string {
+  const pkg = readPackageJson(dir);
+  let main = typeof pkg?.main === 'string' ? pkg.main : 'index';
+  // Strip a leading ./ and any JS extension; Metro wants the bare module path.
+  main = main.replace(/^\.\//, '').replace(/\.(js|jsx|ts|tsx)$/, '');
+  if (!main) main = 'index';
+  return `/${main}.bundle?platform=web&dev=true`;
 }
 
 function hasNestApp(dir: string): boolean {
@@ -143,7 +184,10 @@ function autoDetectServices(
         name: 'nestjs-api',
         cwd: apiPath,
         startCommand: 'npm run start',
-        readySignal: 'Nest application successfully started',
+        readySignals: [
+          'Nest application successfully started',
+          'Application is running on',
+        ],
         port: 3000,
         healthCheck: ip ? `http://${ip}:3000` : 'http://localhost:3000',
         timeoutMs: DEFAULT_TIMEOUT_MS,
@@ -159,7 +203,7 @@ function autoDetectServices(
           name: 'api',
           cwd: apiPath,
           startCommand: startScript,
-          readySignal: 'listening',
+          readySignals: ['listening', 'Server running', 'started on'],
           port: 3000,
           timeoutMs: DEFAULT_TIMEOUT_MS,
           requiresNodeModules: true,
@@ -175,33 +219,46 @@ function autoDetectServices(
       name: 'expo-web',
       cwd: expoPath,
       startCommand: 'npx expo start --web --port 8081',
-      readySignal: 'ready in',
+      // Expo CLI / Metro output varies by version; match any of these.
+      readySignals: [
+        'Waiting on http',
+        'Web is waiting',
+        'Logs for your project',
+        'Bundled ',
+        'ready in',
+        'Metro waiting',
+      ],
       port: 8081,
-      timeoutMs: DEFAULT_TIMEOUT_MS,
+      timeoutMs: FRONTEND_TIMEOUT_MS,
       requiresNodeModules: true,
       type: 'frontend',
+      // Force a real web bundle so import/resolve errors actually surface.
+      // Path derived from package.json `main` (expo-router uses expo-router/entry).
+      bundleProbePath: getExpoBundleProbePath(expoPath),
     });
   } else if (hasNextApp(expoPath)) {
     services.push({
       name: 'nextjs',
       cwd: expoPath,
       startCommand: 'npm run dev',
-      readySignal: 'Ready in',
+      readySignals: ['Ready in', 'started server on', 'Local:'],
       port: 3000,
-      timeoutMs: DEFAULT_TIMEOUT_MS,
+      timeoutMs: FRONTEND_TIMEOUT_MS,
       requiresNodeModules: true,
       type: 'frontend',
+      bundleProbePath: '/',
     });
   } else if (hasViteApp(expoPath)) {
     services.push({
       name: 'vite',
       cwd: expoPath,
       startCommand: 'npm run dev',
-      readySignal: 'ready in',
+      readySignals: ['ready in', 'Local:', 'VITE v'],
       port: 5173,
-      timeoutMs: DEFAULT_TIMEOUT_MS,
+      timeoutMs: FRONTEND_TIMEOUT_MS,
       requiresNodeModules: true,
       type: 'frontend',
+      bundleProbePath: '/',
     });
   }
 

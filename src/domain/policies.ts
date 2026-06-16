@@ -18,6 +18,12 @@ export interface AutonomousRunPolicy {
   maxParallelTasks: number;
   maxRetriesPerTask: number;
   maxImprovementCycles: number;
+  /**
+   * Max runtime auto-healing rounds (boot the app, fix what stops it from
+   * starting, retry). INDEPENDENT of maxImprovementCycles — getting the app to
+   * boot at all is not the same as polishing working code. 0 disables healing.
+   */
+  maxRuntimeHealCycles: number;
   maxHours: number;
   maxCommits: number;
   /** Max tokens across all tasks in a single run (0 = unlimited) */

@@ -13,6 +13,7 @@ export function getDefaultAutonomousRunPolicy(): AutonomousRunPolicy {
     maxParallelTasks: 3,
     maxRetriesPerTask: 2,
     maxImprovementCycles: 2,
+    maxRuntimeHealCycles: 3,
     maxHours: 1,
     maxCommits: 8,
     maxTokensPerRun: 2_000_000,
@@ -39,6 +40,8 @@ export function normalizePolicy(policy: AutonomousRunPolicy): AutonomousRunPolic
     maxParallelTasks: clamp(policy.maxParallelTasks, 1, 6),
     maxRetriesPerTask: clamp(policy.maxRetriesPerTask, 0, 5),
     maxImprovementCycles: clamp(policy.maxImprovementCycles, 0, 4),
+    // `?? 3` so policies persisted before this field existed still get healing.
+    maxRuntimeHealCycles: clamp(policy.maxRuntimeHealCycles ?? 3, 0, 5),
     maxHours: clamp(policy.maxHours, 1, 4),
     maxCommits: clamp(policy.maxCommits, 1, 50),
     maxTokensPerRun: policy.maxTokensPerRun ?? 2_000_000,

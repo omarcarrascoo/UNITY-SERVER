@@ -5,7 +5,7 @@ import { getRuntimeConfig, getProjectByName } from '../config.js';
 
 const execPromise = util.promisify(exec);
 import { getFigmaContext } from '../figma.js';
-import { prepareWorkspace } from '../git.js';
+import { prepareWorkspace, refreshWorkspaceDependencies } from '../git.js';
 import { getProjectMemory, getProjectTree } from '../scanner.js';
 import { generateAndWriteCode } from '../ai.js';
 import type {
@@ -30,7 +30,8 @@ import {
   getDiffAgainstHead,
   pushBranch,
 } from '../services/orchestration/branch-manager.js';
-import { runRuntimeGate, runStaticGates, summarizeGateResults } from '../services/orchestration/gates.js';
+import { runRuntimeGate, runRuntimeGateDetailed, runStaticGates, summarizeGateResults } from '../services/orchestration/gates.js';
+import { buildRuntimeRepairTasks, hasHealableFailures } from '../services/orchestration/runtime-healing.js';
 import { planAutonomousRun } from '../services/orchestration/planner.js';
 import { getProjectPolicy } from '../services/orchestration/policy-engine.js';
 import { reviewTaskResult } from '../services/orchestration/reviewer.js';
@@ -278,6 +279,14 @@ function getOutOfScopePaths(workspace: PreparedWorkspace, diff: string, scopes: 
 
     return true;
   });
+}
+
+const DEPENDENCY_FILE_PATTERN = /(^|\/)(package\.json|package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/;
+
+/** Did this task add/change a dependency manifest (so the base needs reinstall)? */
+function taskChangedDependencies(writeScope: string[], diff: string): boolean {
+  if (writeScope.some((scope) => DEPENDENCY_FILE_PATTERN.test(scope))) return true;
+  return extractChangedPaths(diff).some((file) => DEPENDENCY_FILE_PATTERN.test(file));
 }
 
 function extractEditedFiles(diff: string): string[] {
@@ -1088,6 +1097,11 @@ async function executeApprovedRun(
   let pendingImprovementDrafts: PlanTaskDraft[] = [];
   let latestTargetRoute = '/';
   let budgetNote: string | null = null;
+  // Runtime auto-healing state: cache the last in-loop runtime gate result so the
+  // closure can reuse it instead of running the gate a second time.
+  let runtimeResultsFromHealing: GateResult[] | null = null;
+  let runtimeHealCycles = 0;
+  let depsTouchedDuringRun = false;
 
   while (commitsCreated < policy.maxCommits) {
     if (signal?.aborted) {
@@ -1172,6 +1186,78 @@ async function executeApprovedRun(
         continue;
       }
 
+      // ── Runtime auto-healing (Part B) ──
+      // All planned + reviewer-improvement work is done. Boot the app; if it fails
+      // with something fixable and we still have cycle/commit/time budget, spawn
+      // scoped repair tasks and re-enter THIS loop to run them, then re-check.
+      // Runtime healing has its OWN budget (maxRuntimeHealCycles), independent of
+      // maxImprovementCycles — booting the app is not the same as polishing code.
+      const canHealMore =
+        !gracefulDrainRequested &&
+        commitsCreated < policy.maxCommits &&
+        runtimeHealCycles < policy.maxRuntimeHealCycles;
+
+      if (canHealMore) {
+        await checkoutBranch(baseWorkspace.repoPath, run.branchName);
+
+        // If a task changed dependencies, the base node_modules (symlinked into
+        // worktrees) may be stale — refresh before booting (Part A2).
+        if (depsTouchedDuringRun) {
+          await refreshWorkspaceDependencies(baseWorkspace, (m) => {
+            if (onProgress) void onProgress(m);
+          });
+          depsTouchedDuringRun = false;
+        }
+
+        if (onProgress) {
+          await onProgress(`🌐 Runtime healing check ${runtimeHealCycles + 1}: booting app to verify it runs...`);
+        }
+
+        const detailed = await runRuntimeGateDetailed(baseWorkspace, policy, latestTargetRoute, onProgress);
+        runtimeResultsFromHealing = detailed.results;
+        runtimeHealCycles += 1;
+
+        const runtimePassed = detailed.results.every((g) => g.status !== 'failed');
+        if (runtimePassed) {
+          break; // app boots — done
+        }
+
+        if (hasHealableFailures(detailed.failures)) {
+          const repairDrafts = buildRuntimeRepairTasks(detailed.failures);
+          unityStore.updateRun(run.id, { status: 'healing' });
+          // Label repair tasks by heal round (NOT improvementCycle — separate budget).
+          const repairTasks = createImprovementTasks(
+            run.id,
+            runtimeHealCycles,
+            dedupeFollowUpTasks(repairDrafts),
+            allTasks.length,
+          );
+          for (const task of repairTasks) {
+            unityStore.createTask(task);
+          }
+          unityStore.addEvent(
+            createEntityId('event'),
+            run.id,
+            null,
+            'warning',
+            'run.runtime_healing',
+            `Runtime gate failed; created ${repairTasks.length} repair task(s).`,
+            { failures: detailed.failures.map((f) => ({ kind: f.kind, detail: f.detail })) },
+          );
+          if (onProgress) {
+            await onProgress(
+              `🩹 Runtime failed to boot — created ${repairTasks.length} repair task(s) and retrying. (${detailed.failures.map((f) => f.detail).join('; ')})`,
+            );
+          }
+          continue; // re-enter loop to run repair tasks, then re-check
+        }
+
+        // Runtime failed but nothing is safely auto-fixable — stop healing.
+        if (onProgress) {
+          await onProgress(`⚠️ Runtime gate failed with no auto-fixable cause; leaving as a warning.`);
+        }
+      }
+
       break;
     }
 
@@ -1211,6 +1297,11 @@ async function executeApprovedRun(
           await integrateTaskResult(baseWorkspace, run, result);
           commitsCreated += result.outcome.commitSha ? 1 : 0;
           latestTargetRoute = result.targetRoute || latestTargetRoute;
+          // Track dependency changes so the runtime healing check can refresh the
+          // base node_modules before booting (worktrees symlink the base) (A2).
+          if (taskChangedDependencies(task.writeScope, result.diff)) {
+            depsTouchedDuringRun = true;
+          }
           unityStore.updateTask(task.id, {
             status: 'succeeded',
             commitSha: result.outcome.commitSha || null,
@@ -1403,7 +1494,10 @@ async function executeApprovedRun(
     );
     await onProgress(`🌐 Starting runtime gate for route ${latestTargetRoute}...`);
   }
-  const runtimeResults = await runRuntimeGate(baseWorkspace, policy, latestTargetRoute, onProgress);
+  // Reuse the runtime result from the healing loop if it already ran the gate;
+  // otherwise run it now (e.g. drain/budget paths that skipped healing).
+  const runtimeResults =
+    runtimeResultsFromHealing ?? (await runRuntimeGate(baseWorkspace, policy, latestTargetRoute, onProgress));
   unityStore.addArtifact(
     createEntityId('artifact'),
     run.id,

@@ -5,7 +5,7 @@ import util from 'util';
 import type { GateResult } from '../../domain/orchestration.js';
 import type { AutonomousRunPolicy } from '../../domain/policies.js';
 import type { PreparedWorkspace } from '../../domain/runtime.js';
-import { runProjectRuntimeGate } from './runtime-gate.js';
+import { runProjectRuntimeGate, type RuntimeFailure } from './runtime-gate.js';
 import { buildImportGraph as buildImportGraphShared, type ImportGraph } from '../../shared/import-graph.js';
 
 const execPromise = util.promisify(exec);
@@ -357,38 +357,59 @@ export async function runStaticGates(
   return results;
 }
 
+export interface RuntimeGateDetailed {
+  results: GateResult[];
+  /** Structured, classified boot failures for auto-healing (empty when passed/skipped). */
+  failures: RuntimeFailure[];
+}
+
+/**
+ * Run the runtime gate and return BOTH the GateResult[] (for summaries/closure)
+ * AND the structured failures (for auto-healing). Prefer this in the orchestrator.
+ */
+export async function runRuntimeGateDetailed(
+  workspace: PreparedWorkspace,
+  policy: AutonomousRunPolicy,
+  targetRoute = '/',
+  onLog?: (message: string) => Promise<void> | void,
+): Promise<RuntimeGateDetailed> {
+  if (!policy.gates.runRuntime) {
+    return {
+      results: [{ name: 'runtime', status: 'skipped', details: 'Runtime gate disabled by policy.' }],
+      failures: [],
+    };
+  }
+
+  const runtimeResult = await runProjectRuntimeGate(workspace, targetRoute, onLog);
+
+  return {
+    results: [
+      {
+        name: 'runtime',
+        status: runtimeResult.status,
+        details: runtimeResult.details,
+      },
+      {
+        name: 'runtime:url',
+        status: runtimeResult.status === 'passed' ? 'passed' : 'skipped',
+        details: runtimeResult.localUrl
+          ? `Local: ${runtimeResult.localUrl}${runtimeResult.publicUrl ? ` | Public: ${runtimeResult.publicUrl}` : ''}`
+          : 'No runtime URLs available.',
+      },
+    ],
+    failures: runtimeResult.failures,
+  };
+}
+
+/** Back-compat wrapper returning only GateResult[]. */
 export async function runRuntimeGate(
   workspace: PreparedWorkspace,
   policy: AutonomousRunPolicy,
   targetRoute = '/',
   onLog?: (message: string) => Promise<void> | void,
 ): Promise<GateResult[]> {
-  if (!policy.gates.runRuntime) {
-    return [
-      {
-        name: 'runtime',
-        status: 'skipped',
-        details: 'Runtime gate disabled by policy.',
-      },
-    ];
-  }
-
-  const runtimeResult = await runProjectRuntimeGate(workspace, targetRoute, onLog);
-
-  return [
-    {
-      name: 'runtime',
-      status: runtimeResult.status,
-      details: runtimeResult.details,
-    },
-    {
-      name: 'runtime:url',
-      status: runtimeResult.status === 'passed' ? 'passed' : 'skipped',
-      details: runtimeResult.localUrl
-        ? `Local: ${runtimeResult.localUrl}${runtimeResult.publicUrl ? ` | Public: ${runtimeResult.publicUrl}` : ''}`
-        : 'No runtime URLs available.',
-    },
-  ];
+  const { results } = await runRuntimeGateDetailed(workspace, policy, targetRoute, onLog);
+  return results;
 }
 
 export function summarizeGateResults(results: GateResult[]): string {
