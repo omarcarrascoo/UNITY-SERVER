@@ -26,6 +26,10 @@ import {
 } from '../../services/orchestration/policy-engine.js';
 import { getTelemetryStore } from '../../services/telemetry/telemetry-store.js';
 import { getLearningStore } from '../../services/learning/learning-store.js';
+import { getApprovalGateway } from '../../a2a/approval/approval-gateway.js';
+import { runMarketingDraft } from '../../a2a/executors/marketing.executor.js';
+import { setTicketSink } from '../../services/tickets/ticket-notifier.js';
+import { routeAndDispatch } from '../../a2a/registry/route-and-dispatch.js';
 
 const runtimeConfig = getRuntimeConfig();
 const DISCORD_CONTENT_LIMIT = 3800;
@@ -102,6 +106,12 @@ function parseButtonContext(customId: string): {
     };
   }
 
+  // Approval gateway buttons: "approve-appr:<id>" / "reject-appr:<id>" (2 parts).
+  if (customId.startsWith('approve-appr:') || customId.startsWith('reject-appr:')) {
+    const [action, approvalId] = customId.split(':');
+    return { action, sessionId: approvalId };
+  }
+
   if (customId.includes(':')) {
     const [action, encodedProjectName, sessionId] = customId.split(':');
 
@@ -135,6 +145,58 @@ async function cleanupLostSession(
 }
 
 export function registerDiscordHandlers(client: Client, runtime: RuntimeState): void {
+  // Find a text channel by name (returns the first sendable match, or null).
+  const findChannel = (name: string): any =>
+    client.channels.cache.find((c: any) => c?.name === name && typeof c?.send === 'function') as any;
+
+  // Wire the Approval Gateway to Discord: when an agent (e.g. Marketing) requests
+  // approval for an outward action, post ✅/🗑️ buttons to the APPROVALS channel.
+  getApprovalGateway().setNotifier(async (approvalId, request) => {
+    const channel = findChannel(runtimeConfig.approvalsChannelName);
+    if (!channel) {
+      throw new Error(`Approvals channel #${runtimeConfig.approvalsChannelName} not found.`);
+    }
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`approve-appr:${approvalId}`)
+        .setLabel('✅ Approve')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`reject-appr:${approvalId}`)
+        .setLabel('🗑️ Reject')
+        .setStyle(ButtonStyle.Danger),
+    );
+    await channel.send({
+      content: [
+        `🔔 **Authorization requested by \`${request.requestedBy}\`**`,
+        `**${request.title}**`,
+        '',
+        request.detail.length > 1500 ? request.detail.slice(0, 1500) + '…' : request.detail,
+        '',
+        '_Approve to let the agent proceed, or Reject to cancel._',
+      ].join('\n'),
+      components: [row],
+    });
+  });
+
+  // Wire ticket changes to Discord: announce meaningful transitions (→done,
+  // →blocked) and new manual tickets to the TICKETS channel.
+  setTicketSink((change) => {
+    const t = change.ticket;
+    const announce =
+      (change.kind === 'status' && (t.status === 'done' || t.status === 'blocked')) ||
+      (change.kind === 'created' && t.source === 'manual');
+    if (!announce) return;
+    const channel = findChannel(runtimeConfig.ticketsChannelName);
+    if (!channel) return;
+    const icon = t.status === 'done' ? '✅' : t.status === 'blocked' ? '🚧' : '🎫';
+    const line =
+      change.kind === 'created'
+        ? `🎫 **New ticket:** ${t.title}`
+        : `${icon} **Ticket ${t.status}:** ${t.title}${change.fromStatus ? ` _(was ${change.fromStatus})_` : ''}`;
+    void channel.send(line).catch(() => {});
+  });
+
   client.on('messageCreate', async (message: Message) => {
     if (message.author.bot) return;
 
@@ -369,6 +431,24 @@ export function registerDiscordHandlers(client: Client, runtime: RuntimeState): 
         } else {
           await interaction.update({ content: '⚠️ No hay ninguna tarea corriendo.', components: [] });
         }
+        return;
+      }
+
+      // ── Approval Gateway buttons (approve-appr / reject-appr) ──
+      // Handled BEFORE the isProcessing() guard: a marketing approval can arrive
+      // while a dev run is executing and must not be blocked by it.
+      if (action === 'approve-appr' || action === 'reject-appr') {
+        const approvalId = sessionId as string;
+        const approved = action === 'approve-appr';
+        const resolved = getApprovalGateway().resolve(approvalId, approved, interaction.user?.username || 'discord-user');
+        await interaction.update({
+          content: resolved
+            ? approved
+              ? '✅ **Aprobado.** El agente continuará con la acción.'
+              : '🗑️ **Rechazado.** El agente cancelará la acción.'
+            : '⚠️ Esta solicitud de autorización ya no está activa (resuelta o expirada).',
+          components: [],
+        });
         return;
       }
 
@@ -615,6 +695,64 @@ export function registerDiscordHandlers(client: Client, runtime: RuntimeState): 
         } catch (error: any) {
           await interaction.followUp(`❌ Error al crear el proyecto: ${error.message}`);
         }
+        return;
+      }
+
+      if (commandName === 'marketing') {
+        const brief = interaction.options.getString('brief', true);
+        await interaction.reply(`📣 **Marketing Squad** está redactando un post sobre: _${brief}_\n*Te pediré aprobación antes de publicar.*`);
+        // runMarketingDraft drafts, then requests approval via the gateway, which
+        // posts ✅/🗑️ buttons to #unity-agent. We stream progress as follow-ups.
+        runMarketingDraft(brief, (m) => {
+          interaction.followUp(m.length > 1800 ? m.slice(0, 1800) + '…' : m).catch(() => {});
+        })
+          .then((result) => {
+            interaction.followUp(
+              result.status === 'published'
+                ? `✅ **Publicado.** ${result.detail}`
+                : result.status === 'rejected'
+                  ? `🗑️ **No publicado.** ${result.detail}`
+                  : `❌ ${result.detail}`,
+            ).catch(() => {});
+          })
+          .catch((err) => {
+            interaction.followUp(`❌ Marketing falló: ${err?.message || String(err)}`).catch(() => {});
+          });
+        return;
+      }
+
+      if (commandName === 'ask' || commandName === 'brainstorm') {
+        const prompt = interaction.options.getString('prompt', true);
+        const agentChoice = interaction.options.getString('agent') || 'auto';
+        const manualAgentId = agentChoice !== 'auto' ? agentChoice : undefined;
+        // /ask uses the active project; /brainstorm explores with no project.
+        const isBrainstorm = commandName === 'brainstorm';
+        const projectName = isBrainstorm ? 'brainstorm' : runtime.getActiveProjectName();
+        await interaction.reply(
+          isBrainstorm
+            ? `💡 **Brainstorm:** _${prompt}_`
+            : `🧭 **Routing** (project: \`${projectName}\`): _${prompt}_${manualAgentId ? ` → \`${manualAgentId}\`` : ''}`,
+        );
+        routeAndDispatch(prompt, {
+          manualAgentId,
+          projectName,
+          onProgress: (m) => { interaction.followUp(m.length > 1800 ? m.slice(0, 1800) + '…' : m).catch(() => {}); },
+        })
+          .then((r) => {
+            const convNote = `\n_(conversación \`${r.conversationId.slice(0, 12)}\` — re-léela en el panel)_`;
+            if (r.outcome === 'needs-autonomous-run') {
+              interaction.followUp(`🛠️ ${r.detail}\n👉 Manda el prompt al canal autónomo (#${runtimeConfig.autonomousChannelName}) para lanzar un run.${convNote}`).catch(() => {});
+            } else if (r.outcome === 'dispatched') {
+              const out = r.output ? `\n\n${r.output.length > 1500 ? r.output.slice(0, 1500) + '…' : r.output}` : '';
+              interaction.followUp(`✅ **${r.decision.agent.name}** (${r.terminalState}).${out}${convNote}`).catch(() => {});
+            } else {
+              interaction.followUp(`❌ ${r.detail}`).catch(() => {});
+            }
+          })
+          .catch((err) => {
+            interaction.followUp(`❌ Routing falló: ${err?.message || String(err)}`).catch(() => {});
+          });
+        return;
       }
     }
   });

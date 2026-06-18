@@ -1,6 +1,12 @@
 /**
  * Per-project deploy runner.
  *
+ * NOTE (2026-06-16): NOT wired into the UI right now. The panel's old "Deploy"
+ * button was reframed to "Run Locally" (the user wanted to SEE the app running,
+ * not publish to prod). This module is kept for the future "real deploy" feature
+ * (roadmap item: publish FE/BE to a host). Re-wire via a panel button + endpoint
+ * when real deploy is built.
+ *
  * Reads `.unity/deploy.json` from a project's repo root and runs the configured
  * deploy commands (e.g. FE = Expo EAS, BE = NestJS host). Deploy is an OUTWARD,
  * hard-to-reverse action, so it's only ever triggered explicitly from the panel —

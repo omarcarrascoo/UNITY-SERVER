@@ -23,6 +23,10 @@ export interface RuntimeConfig {
   deepseekApiKey?: string;
   manualChannelName: string;
   autonomousChannelName: string;
+  /** Channel for ticket lifecycle notifications. Falls back to autonomous. */
+  ticketsChannelName: string;
+  /** Channel for agent authorization requests (marketing, etc). Falls back to autonomous. */
+  approvalsChannelName: string;
   integrationBranchName: string;
   localConsolePort: number;
 }
@@ -51,6 +55,12 @@ export function getRuntimeConfig(): RuntimeConfig {
     deepseekApiKey: process.env.DEEPSEEK_API_KEY,
     manualChannelName: process.env.UNITY_MANUAL_CHANNEL || 'jarvis-dev',
     autonomousChannelName: process.env.UNITY_AUTONOMOUS_CHANNEL || 'unity-agent',
+    // Dedicated channels; fall back to the autonomous channel when unset so the
+    // system keeps working even if the channels haven't been created yet.
+    ticketsChannelName:
+      process.env.UNITY_TICKETS_CHANNEL || process.env.UNITY_AUTONOMOUS_CHANNEL || 'unity-agent',
+    approvalsChannelName:
+      process.env.UNITY_APPROVALS_CHANNEL || process.env.UNITY_AUTONOMOUS_CHANNEL || 'unity-agent',
     integrationBranchName: process.env.UNITY_INTEGRATION_BRANCH || 'unity-per2323455632',
     localConsolePort: Number(process.env.UNITY_LOCAL_CONSOLE_PORT || 4477),
   };

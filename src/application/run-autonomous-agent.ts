@@ -39,6 +39,7 @@ import { createTaskWorktree, removeTaskWorktree } from '../services/orchestratio
 import { buildLearningContext, extractPattern, recordPatternOutcomes } from '../services/learning/index.js';
 import { runAgentPipeline } from '../services/ai/agent-roles.js';
 import { getKnowledgeGraph } from '../services/knowledge/index.js';
+import { openRunTicket, closeRunTicket } from '../services/tickets/run-tickets.js';
 import {
   isA2ADelegationEnabled,
   delegateImplementation,
@@ -1078,16 +1079,6 @@ async function executeApprovedRun(
   signal?: AbortSignal,
   onProgress?: (message: string) => Promise<void>,
 ): Promise<RunAutonomousAgentResult> {
-  // DIAGNOSTIC (temporary): confirm the run reaches the main execution function.
-  unityStore.addEvent(
-    createEntityId('event'),
-    run.id,
-    null,
-    'info',
-    'run.exec_enter',
-    `executeApprovedRun entered. status=${run.status} existingTasks=${unityStore.listTasksByRun(run.id).length}`,
-  );
-
   const figmaData = await getFigmaContext(run.prompt);
   const projectMemory = getProjectMemory(baseWorkspace.repoPath);
   const existingTasks = unityStore.listTasksByRun(run.id);
@@ -1387,16 +1378,6 @@ async function executeApprovedRun(
     commitsCreated < policy.maxCommits &&
     runtimeHealCycles < policy.maxRuntimeHealCycles;
 
-  // DIAGNOSTIC (temporary): confirm the healing phase is reached and why it gates.
-  unityStore.addEvent(
-    createEntityId('event'),
-    run.id,
-    null,
-    'info',
-    'run.heal_phase',
-    `reached healing phase: canHeal=${canHeal} drain=${gracefulDrainRequested} commits=${commitsCreated}/${policy.maxCommits} healCycles=${runtimeHealCycles}/${policy.maxRuntimeHealCycles}`,
-  );
-
   if (canHeal) {
     await checkoutBranch(baseWorkspace.repoPath, run.branchName);
 
@@ -1634,6 +1615,8 @@ async function executeApprovedRun(
     finishedAt: nowIso(),
     summary,
   });
+  // Move the run's auto-ticket to its terminal board status (best-effort).
+  closeRunTicket({ runId: run.id, runStatus: closure.status, summary });
 
   unityStore.addEvent(
     createEntityId('event'),
@@ -1700,6 +1683,8 @@ export async function createAutonomousRunPlan({
   );
 
   unityStore.createRun(run);
+  // Auto-ticket on the in-house board (best-effort, non-blocking).
+  openRunTicket({ runId: run.id, projectName: project.name, prompt });
   unityStore.addEvent(createEntityId('event'), run.id, null, 'info', 'run.created', 'Autonomous run created.', {
     project: project.name,
     branch: branchState.integrationBranch,

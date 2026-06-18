@@ -17,9 +17,16 @@ import { getTelemetryStore } from '../../services/telemetry/telemetry-store.js';
 import { getLearningStore } from '../../services/learning/learning-store.js';
 import { getKnowledgeGraph } from '../../services/knowledge/index.js';
 import { handleGitHubWebhook } from '../webhooks/index.js';
+import { handleRunStream } from './sse.js';
 import { normalizePolicy, getProjectPolicy } from '../../services/orchestration/policy-engine.js';
 import { createPullRequestFromBranch, resolveWorkspace } from '../../git.js';
 import { runProjectRuntimeGate } from '../../services/orchestration/runtime-gate.js';
+import { runMarketingDraft } from '../../a2a/executors/marketing.executor.js';
+import { routeAndDispatch } from '../../a2a/registry/route-and-dispatch.js';
+import { listAgents } from '../../a2a/registry/agent-registry.js';
+import { getConversationStore, BRAINSTORM } from '../../services/conversations/conversation-store.js';
+import { getTicketStore, TICKET_STATUSES, TICKET_PRIORITIES, type TicketStatus, type TicketPriority } from '../../services/tickets/ticket-store.js';
+import { notifyTicketChange } from '../../services/tickets/ticket-notifier.js';
 
 type RunPayload = NonNullable<ReturnType<typeof buildRunPayload>>;
 
@@ -1050,6 +1057,36 @@ function buildHomePageShell(): string {
           <div id="launch-status" style="margin-top:12px; font-size:12px; display:none;"></div>
         </div>
 
+        <h2 class="section-title">📣 Marketing Squad</h2>
+        <div style="background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius); padding:20px; margin-bottom:32px;">
+          <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Drafts a social post from your brief. You approve or reject it in Discord (#unity-agent) before it's published.</div>
+          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:stretch;">
+            <input id="mkt-brief" type="text" placeholder="e.g. Announce that Jarvis can now auto-heal failing deploys" style="flex:1; min-width:240px; background:var(--bg-app); border:1px solid var(--border); color:var(--text-main); padding:10px 14px; border-radius:8px; font-size:13px; outline:none;" />
+            <button type="button" id="mkt-submit" style="background:var(--text-main); color:var(--bg-app); border:none; border-radius:8px; padding:10px 20px; font-size:13px; font-weight:600; cursor:pointer; white-space:nowrap;">Draft Post</button>
+          </div>
+          <div id="mkt-status" style="margin-top:12px; font-size:12px; display:none;"></div>
+        </div>
+
+        <h2 class="section-title">🧭 Ask an Agent</h2>
+        <div style="background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius); padding:20px; margin-bottom:32px;">
+          <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Describe what you need; the router picks the right agent — or force one. Pick a project to scope the conversation, or <b>Brainstorm</b> to explore ideas with no project. Follow-ups remember the thread.</div>
+          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:stretch; margin-bottom:10px;">
+            <select id="ask-project" title="Active project (scopes the conversation)" style="background:var(--bg-app); border:1px solid var(--border); color:var(--text-main); padding:10px 14px; border-radius:8px; font-size:13px;">
+              <option value="brainstorm" selected>💡 Brainstorm (no project)</option>
+            </select>
+            <select id="ask-agent" style="background:var(--bg-app); border:1px solid var(--border); color:var(--text-main); padding:10px 14px; border-radius:8px; font-size:13px;">
+              <option value="auto" selected>Auto (router decides)</option>
+            </select>
+            <button type="button" id="ask-new" title="Start a new conversation" style="background:var(--bg-app); border:1px solid var(--border); color:var(--text-muted); border-radius:8px; padding:10px 14px; font-size:13px; cursor:pointer;">＋ New</button>
+          </div>
+          <div id="ask-thread" style="display:none; max-height:320px; overflow-y:auto; background:var(--bg-app); border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:10px; font-size:12px;"></div>
+          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:stretch;">
+            <input id="ask-prompt" type="text" placeholder="Ask something (or a follow-up)…" style="flex:1; min-width:240px; background:var(--bg-app); border:1px solid var(--border); color:var(--text-main); padding:10px 14px; border-radius:8px; font-size:13px; outline:none;" />
+            <button type="button" id="ask-submit" style="background:var(--text-main); color:var(--bg-app); border:none; border-radius:8px; padding:10px 20px; font-size:13px; font-weight:600; cursor:pointer; white-space:nowrap;">Ask</button>
+          </div>
+          <div id="ask-status" style="margin-top:10px; font-size:12px; display:none; white-space:pre-wrap; color:var(--text-muted);"></div>
+        </div>
+
         <h2 class="section-title">System Health</h2>
         <div class="health-grid" id="health-grid"></div>
 
@@ -1387,9 +1424,120 @@ function buildHomePageShell(): string {
       renderRecent();
 
       document.getElementById('runs-search').addEventListener('input',function(){renderSidebar(filterRuns(allRuns));renderRunsTable(filterRuns(allRuns));});
+
+      // Marketing Squad trigger
+      var mktBtn = document.getElementById('mkt-submit');
+      if (mktBtn) mktBtn.onclick = async function(){
+        var brief = (document.getElementById('mkt-brief').value || '').trim();
+        var st = document.getElementById('mkt-status');
+        if (!brief) { st.style.display='block'; st.style.color='#f87171'; st.textContent='Escribe un brief primero.'; return; }
+        mktBtn.disabled = true; var orig = mktBtn.textContent; mktBtn.textContent = 'Drafting...';
+        st.style.display='block'; st.style.color='var(--text-muted)'; st.textContent='Redactando post... la aprobación aparecerá en Discord (#unity-agent).';
+        try {
+          var r = await fetch('/api/marketing', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({brief: brief}) });
+          var d = await r.json();
+          st.style.color = r.ok ? '#4ade80' : '#f87171';
+          st.textContent = r.ok ? '✅ ' + d.message : ('❌ ' + (d.error || 'error'));
+        } catch(e) { st.style.color='#f87171'; st.textContent='❌ Request failed.'; }
+        mktBtn.disabled = false; mktBtn.textContent = orig;
+      };
+
+      // Ask-an-agent (router) — project-scoped, conversational with follow-ups.
+      var askConvId = null;          // current conversation (null = will start new)
+      var askThreadMsgs = [];        // [{role, agentId, content}]
+      var ASK_PROJECT_KEY = 'unity.askProject';
+
+      async function loadAgents(){
+        try {
+          var r = await fetch('/api/agents'); var agents = await r.json();
+          var sel = document.getElementById('ask-agent');
+          if (sel && agents.length) {
+            sel.innerHTML = '<option value="auto" selected>Auto (router decides)</option>' +
+              agents.map(function(a){ return '<option value="'+safe(a.id)+'">'+safe(a.name)+'</option>'; }).join('');
+          }
+        } catch(e){}
+      }
+      async function loadAskProjects(){
+        try {
+          var r = await fetch('/api/projects'); var projects = await r.json();
+          var sel = document.getElementById('ask-project');
+          if (!sel) return;
+          var saved = ''; try { saved = localStorage.getItem(ASK_PROJECT_KEY) || ''; } catch(e){}
+          sel.innerHTML = '<option value="brainstorm">💡 Brainstorm (no project)</option>' +
+            projects.map(function(p){ return '<option value="'+safe(p.name)+'">'+safe(p.name)+'</option>'; }).join('');
+          if (saved) sel.value = saved;
+          sel.onchange = function(){ try{ localStorage.setItem(ASK_PROJECT_KEY, sel.value); }catch(e){}; newAskConversation(); };
+        } catch(e){}
+      }
+      function renderAskThread(){
+        var el = document.getElementById('ask-thread');
+        if (!askThreadMsgs.length) { el.style.display='none'; return; }
+        el.style.display='block';
+        el.innerHTML = askThreadMsgs.map(function(m, i){
+          var who = m.role==='user' ? '🧑 You' : ('🤖 '+(m.agentId||'agent'));
+          var col = m.role==='user' ? 'var(--text-main)' : '#4ade80';
+          // Agent answers can be promoted to a ticket (great for landing brainstorm ideas).
+          var promote = m.role==='agent'
+            ? ' <button data-idx="'+i+'" class="idea-ticket" style="font-size:9px; padding:1px 6px; border-radius:4px; background:var(--bg-surface); border:1px solid var(--border); color:var(--text-muted); cursor:pointer;">📌 → ticket</button>'
+            : '';
+          return '<div style="margin-bottom:8px;"><div style="font-size:10px; color:'+col+'; font-weight:600;">'+who+promote+'</div><div style="white-space:pre-wrap; color:var(--text-muted);">'+safe(m.content)+'</div></div>';
+        }).join('');
+        Array.prototype.forEach.call(el.querySelectorAll('.idea-ticket'), function(b){
+          b.onclick = async function(){
+            var msg = askThreadMsgs[parseInt(b.getAttribute('data-idx'),10)];
+            if (!msg) return;
+            var proj = document.getElementById('ask-project').value;
+            var title = (msg.content||'').replace(/\\s+/g,' ').slice(0,70);
+            b.disabled = true; b.textContent = 'saving…';
+            try {
+              await fetch('/api/tickets', { method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({ title: title, description: msg.content, projectName: proj==='brainstorm'?null:proj, priority:'normal' }) });
+              b.textContent = '✓ ticket';
+            } catch(e) { b.disabled=false; b.textContent='📌 → ticket'; }
+          };
+        });
+        el.scrollTop = el.scrollHeight;
+      }
+      function newAskConversation(){ askConvId=null; askThreadMsgs=[]; renderAskThread(); var st=document.getElementById('ask-status'); if(st) st.style.display='none'; }
+      var askNewBtn = document.getElementById('ask-new');
+      if (askNewBtn) askNewBtn.onclick = newAskConversation;
+
+      var askBtn = document.getElementById('ask-submit');
+      if (askBtn) askBtn.onclick = async function(){
+        var promptEl = document.getElementById('ask-prompt');
+        var prompt = (promptEl.value || '').trim();
+        var agent = document.getElementById('ask-agent').value;
+        var project = document.getElementById('ask-project').value;
+        var st = document.getElementById('ask-status');
+        if (!prompt) { st.style.display='block'; st.style.color='#f87171'; st.textContent='Escribe qué necesitas.'; return; }
+        askThreadMsgs.push({role:'user', content:prompt}); renderAskThread();
+        promptEl.value='';
+        askBtn.disabled = true; var orig = askBtn.textContent; askBtn.textContent = '…';
+        st.style.display='block'; st.style.color='var(--text-muted)'; st.textContent='Routing & dispatching…';
+        try {
+          var body = { prompt: prompt, agent: agent, projectName: project };
+          if (askConvId) body.conversationId = askConvId;
+          var r = await fetch('/api/route', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+          var d = await r.json();
+          if (!r.ok) { st.style.color='#f87171'; st.textContent='❌ '+(d.error||'error'); }
+          else {
+            askConvId = d.conversationId || askConvId;
+            var answer = d.outcome==='dispatched' ? (d.output || ('('+d.terminalState+')'))
+                       : d.outcome==='needs-autonomous-run' ? ('🛠️ '+d.detail)
+                       : ('❌ '+d.detail);
+            askThreadMsgs.push({role:'agent', agentId:d.agentName, content:answer}); renderAskThread();
+            st.style.color='var(--text-muted)'; st.textContent='Routed to '+d.agentName+' ('+d.via+': '+d.reason+')';
+          }
+        } catch(e) { st.style.color='#f87171'; st.textContent='❌ Request failed.'; }
+        askBtn.disabled = false; askBtn.textContent = orig;
+      };
+      document.getElementById('ask-prompt').addEventListener('keydown', function(e){ if(e.key==='Enter') askBtn.click(); });
+
       loadRuns();
       renderHealth();
       loadProjects();
+      loadAgents();
+      loadAskProjects();
       loadPairSessions();
       setInterval(loadRuns,5000);
       setInterval(loadPairSessions,5000);
@@ -2056,6 +2204,8 @@ function renderRunPage(
 function buildGlobalNavHtml(active: string): string {
   const items = [
     { href: '/', label: 'Home', id: '/' },
+    { href: '/board', label: 'Board', id: '/board' },
+    { href: '/conversations', label: 'Conversations', id: '/conversations' },
     { href: '/analytics', label: 'Analytics', id: '/analytics' },
     { href: '/knowledge', label: 'Knowledge', id: '/knowledge' },
     { href: '/learning', label: 'Learning', id: '/learning' },
@@ -2288,6 +2438,167 @@ function buildKnowledgePage(): string {
     load();
   `);
 }
+
+function buildBoardPage(): string {
+  return shellPage(
+    'Board',
+    '/board',
+    `
+    <h1 class="page-title">Board</h1>
+    <p class="page-subtitle">In-house ticket board. Auto tickets come from autonomous runs; you can also create manual tickets. Status changes notify Discord.</p>
+
+    <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:stretch; margin-bottom:24px;">
+      <input id="nt-title" type="text" placeholder="New ticket title" style="flex:1; min-width:240px; background:var(--bg-app); border:1px solid var(--border); color:var(--text-main); padding:10px 14px; border-radius:8px; font-size:13px; outline:none;" />
+      <select id="nt-priority" style="background:var(--bg-app); border:1px solid var(--border); color:var(--text-main); padding:10px 14px; border-radius:8px; font-size:13px;">
+        <option value="low">Low</option>
+        <option value="normal" selected>Normal</option>
+        <option value="high">High</option>
+        <option value="urgent">Urgent</option>
+      </select>
+      <button id="nt-add" type="button" style="background:var(--text-main); color:var(--bg-app); border:none; border-radius:8px; padding:10px 20px; font-size:13px; font-weight:600; cursor:pointer;">Add Ticket</button>
+    </div>
+
+    <div id="board" style="display:grid; grid-template-columns:repeat(5, minmax(180px,1fr)); gap:12px; align-items:start;"></div>
+    `,
+    `
+    var STATUSES = [
+      { key:'backlog', label:'Backlog', color:'#6b7280' },
+      { key:'todo', label:'To Do', color:'#60a5fa' },
+      { key:'in_progress', label:'In Progress', color:'#a78bfa' },
+      { key:'done', label:'Done', color:'#4ade80' },
+      { key:'blocked', label:'Blocked', color:'#f87171' },
+    ];
+    function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
+    var PRIO = { urgent:{rank:3,color:'#f87171',label:'URGENT'}, high:{rank:2,color:'#fb923c',label:'HIGH'}, normal:{rank:1,color:'#6b7280',label:'NORMAL'}, low:{rank:0,color:'#4b5563',label:'LOW'} };
+
+    async function loadBoard(){
+      var r = await fetch('/api/tickets');
+      var data = await r.json();
+      var tickets = data.tickets || [];
+      var board = document.getElementById('board');
+      board.innerHTML = STATUSES.map(function(col){
+        var items = tickets.filter(function(t){ return t.status===col.key; });
+        // Sort by priority (urgent first) — mirrors future autonomous self-tasking pick order.
+        items.sort(function(a,b){ return (PRIO[b.priority]||PRIO.normal).rank - (PRIO[a.priority]||PRIO.normal).rank; });
+        var cards = items.map(function(t){
+          var opts = STATUSES.map(function(s){ return '<option value="'+s.key+'"'+(s.key===t.status?' selected':'')+'>'+s.label+'</option>'; }).join('');
+          var badge = t.source==='auto' ? '<span style="font-size:9px; padding:1px 5px; border-radius:4px; background:#a78bfa22; color:#a78bfa;">AUTO</span>' : '<span style="font-size:9px; padding:1px 5px; border-radius:4px; background:#60a5fa22; color:#60a5fa;">MANUAL</span>';
+          var p = PRIO[t.priority] || PRIO.normal;
+          var prioBadge = '<span style="font-size:9px; padding:1px 5px; border-radius:4px; background:'+p.color+'22; color:'+p.color+';">'+p.label+'</span>';
+          return '<div style="background:var(--bg-surface); border:1px solid var(--border); border-left:3px solid '+p.color+'; border-radius:8px; padding:10px 12px; margin-bottom:8px;">'
+            + '<div style="display:flex; justify-content:space-between; gap:6px; align-items:flex-start;"><div style="font-size:12px; font-weight:500; line-height:1.4;">'+esc(t.title)+'</div></div>'
+            + '<div style="display:flex; gap:4px; margin-top:6px;">'+prioBadge+badge+'</div>'
+            + (t.projectName?'<div style="font-size:10px; color:var(--text-muted); margin-top:4px;">'+esc(t.projectName)+'</div>':'')
+            + '<select data-id="'+t.id+'" class="mv" style="margin-top:8px; width:100%; background:var(--bg-app); border:1px solid var(--border); color:var(--text-main); padding:4px 6px; border-radius:6px; font-size:11px;">'+opts+'</select>'
+            + '</div>';
+        }).join('');
+        return '<div>'
+          + '<div style="display:flex; align-items:center; gap:6px; margin-bottom:10px;"><span style="width:8px;height:8px;border-radius:50%;background:'+col.color+';"></span><span style="font-size:12px; font-weight:600;">'+col.label+'</span><span style="font-size:11px; color:var(--text-muted);">'+items.length+'</span></div>'
+          + (cards || '<div style="font-size:11px; color:var(--text-muted); padding:8px 0;">—</div>')
+          + '</div>';
+      }).join('');
+      Array.prototype.forEach.call(document.querySelectorAll('.mv'), function(sel){
+        sel.onchange = async function(){
+          await fetch('/api/tickets/'+sel.getAttribute('data-id'), { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({status: sel.value}) });
+          loadBoard();
+        };
+      });
+    }
+
+    document.getElementById('nt-add').onclick = async function(){
+      var inp = document.getElementById('nt-title');
+      var prio = document.getElementById('nt-priority');
+      var title = (inp.value||'').trim();
+      if(!title) return;
+      await fetch('/api/tickets', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({title: title, priority: prio.value}) });
+      inp.value='';
+      loadBoard();
+    };
+    document.getElementById('nt-title').addEventListener('keydown', function(e){ if(e.key==='Enter') document.getElementById('nt-add').click(); });
+
+    loadBoard();
+    setInterval(loadBoard, 8000);
+    `,
+  );
+}
+
+function buildConversationsPage(): string {
+  return shellPage(
+    'Conversations',
+    '/conversations',
+    `
+    <h1 class="page-title">Conversations</h1>
+    <p class="page-subtitle">Past agent interactions, scoped by project (or Brainstorm). Click one to re-read the thread.</p>
+
+    <div style="display:flex; gap:12px; align-items:center; margin-bottom:16px;">
+      <label style="font-size:12px; color:var(--text-muted);">Project:</label>
+      <select id="conv-project" style="background:var(--bg-app); border:1px solid var(--border); color:var(--text-main); padding:8px 12px; border-radius:8px; font-size:13px;">
+        <option value="">All</option>
+        <option value="brainstorm">💡 Brainstorm</option>
+      </select>
+    </div>
+
+    <div class="two-col" style="grid-template-columns:340px 1fr; align-items:start;">
+      <div id="conv-list" style="display:flex; flex-direction:column; gap:8px;"></div>
+      <div id="conv-detail" style="background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius); padding:20px; min-height:200px;">
+        <div style="color:var(--text-muted); font-size:13px;">Select a conversation to read it.</div>
+      </div>
+    </div>
+    `,
+    `
+    function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
+    var convCache = [];
+
+    async function loadConvProjects(){
+      try {
+        var r = await fetch('/api/projects'); var projects = await r.json();
+        var sel = document.getElementById('conv-project');
+        sel.innerHTML = '<option value="">All</option><option value="brainstorm">💡 Brainstorm</option>' +
+          projects.map(function(p){ return '<option value="'+esc(p.name)+'">'+esc(p.name)+'</option>'; }).join('');
+        sel.onchange = loadConvList;
+      } catch(e){}
+    }
+
+    async function loadConvList(){
+      var project = document.getElementById('conv-project').value;
+      var url = '/api/conversations' + (project ? ('?project='+encodeURIComponent(project)) : '');
+      var r = await fetch(url); convCache = await r.json();
+      var list = document.getElementById('conv-list');
+      if (!convCache.length) { list.innerHTML = '<div style="color:var(--text-muted); font-size:12px; padding:8px;">No conversations yet.</div>'; return; }
+      list.innerHTML = convCache.map(function(c){
+        var when = (c.updatedAt||'').slice(0,16).replace('T',' ');
+        var proj = c.projectName==='brainstorm' ? '💡 Brainstorm' : c.projectName;
+        return '<div class="conv-item" data-id="'+c.id+'" style="cursor:pointer; background:var(--bg-surface); border:1px solid var(--border); border-radius:8px; padding:10px 12px;">'
+          + '<div style="font-size:13px; font-weight:500; line-height:1.4;">'+esc(c.title)+'</div>'
+          + '<div style="font-size:10px; color:var(--text-muted); margin-top:4px;">'+esc(proj)+' · '+when+'</div>'
+          + '</div>';
+      }).join('');
+      Array.prototype.forEach.call(list.querySelectorAll('.conv-item'), function(el){
+        el.onclick = function(){ openConv(el.getAttribute('data-id')); };
+      });
+    }
+
+    async function openConv(id){
+      var detail = document.getElementById('conv-detail');
+      detail.innerHTML = '<div style="color:var(--text-muted);">Loading…</div>';
+      try {
+        var r = await fetch('/api/conversations/'+id); var c = await r.json();
+        var proj = c.projectName==='brainstorm' ? '💡 Brainstorm' : c.projectName;
+        var msgs = (c.messages||[]).map(function(m){
+          var who = m.role==='user' ? '🧑 You' : ('🤖 '+(m.agentId||'agent')+(m.routedVia?' ['+m.routedVia+']':''));
+          var col = m.role==='user' ? 'var(--text-main)' : '#4ade80';
+          return '<div style="margin-bottom:14px;"><div style="font-size:10px; color:'+col+'; font-weight:600; margin-bottom:2px;">'+esc(who)+'</div><div style="white-space:pre-wrap; font-size:13px; color:var(--text-muted); line-height:1.6;">'+esc(m.content)+'</div></div>';
+        }).join('');
+        detail.innerHTML = '<div style="border-bottom:1px solid var(--border); padding-bottom:10px; margin-bottom:14px;"><div style="font-size:15px; font-weight:500;">'+esc(c.title)+'</div><div style="font-size:11px; color:var(--text-muted); margin-top:2px;">'+esc(proj)+' · '+(c.messages||[]).length+' messages</div></div>'+msgs;
+      } catch(e) { detail.innerHTML = '<div style="color:#f87171;">Failed to load conversation.</div>'; }
+    }
+
+    loadConvProjects();
+    loadConvList();
+    `,
+  );
+}
+
 
 function buildSettingsPage(): string {
   return shellPage('Settings', '/settings', `
@@ -2674,6 +2985,12 @@ export function startUnityHttpServer(runtime: RuntimeState) {
         return;
       }
 
+      // Global live SSE firehose (all runs) — powers the app-wide JARVIS narrator.
+      if (req.method === 'GET' && pathname === '/api/stream') {
+        handleRunStream(req, res, {});
+        return;
+      }
+
       if (req.method === 'POST' && pathname === '/webhooks/github') {
         await handleGitHubWebhook(req, res, runtime);
         return;
@@ -2691,6 +3008,16 @@ export function startUnityHttpServer(runtime: RuntimeState) {
 
       if (req.method === 'GET' && pathname === '/knowledge') {
         sendHtml(res, buildKnowledgePage());
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/board') {
+        sendHtml(res, buildBoardPage());
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/conversations') {
+        sendHtml(res, buildConversationsPage());
         return;
       }
 
@@ -2718,11 +3045,14 @@ export function startUnityHttpServer(runtime: RuntimeState) {
           return;
         }
 
-        const abortController = runtime.startProcessing();
+        // Register under the REAL runId (+project) so cancel-by-runId matches —
+        // keeps the panel in sync with the API handlers.
+        const approvingRun = unityStore.getRun(runId);
+        const abortController = runtime.startProcessing(runId, approvingRun?.projectName);
         try {
           approveAutonomousRunPlan(runId, 'local-ui-form');
         } catch (error) {
-          runtime.finishProcessing();
+          runtime.finishProcessing(runId);
           throw error;
         }
 
@@ -2752,7 +3082,7 @@ export function startUnityHttpServer(runtime: RuntimeState) {
             );
           })
           .finally(() => {
-            runtime.finishProcessing();
+            runtime.finishProcessing(runId);
           });
 
         redirect(res, `/runs/${runId}`);
@@ -2769,9 +3099,171 @@ export function startUnityHttpServer(runtime: RuntimeState) {
       }
 
       if (req.method === 'POST' && extractConsoleRunId(pathname, '/cancel')) {
-        runtime.abortCurrentTask();
-        redirect(res, `/runs/${extractConsoleRunId(pathname, '/cancel')}`);
+        const cancelRunId = extractConsoleRunId(pathname, '/cancel') as string;
+        runtime.abortCurrentTask(cancelRunId); // abort THIS run (keyed by runId)
+        redirect(res, `/runs/${cancelRunId}`);
         return;
+      }
+
+      /* ── Marketing Squad: draft a post (approval happens via Discord buttons) ── */
+      if (req.method === 'POST' && pathname === '/api/marketing') {
+        const body = await readJsonBody(req);
+        const brief = String(body.brief || '').trim();
+        if (!brief) {
+          sendJson(res, 400, { error: 'brief is required.' });
+          return;
+        }
+        // Fire-and-forget: drafting + the approval wait can take minutes, and the
+        // ✅/🗑️ approval buttons appear in Discord (#unity-agent), not here.
+        void runMarketingDraft(brief, (m) => console.log(`[marketing] ${m}`))
+          .then((result) => console.log(`[marketing] done: ${result.status} — ${result.detail}`))
+          .catch((err) => console.error('[marketing] failed:', err?.message || err));
+        sendJson(res, 202, {
+          ok: true,
+          message: 'Marketing draft started. Approve/reject in Discord (#unity-agent) when prompted.',
+        });
+        return;
+      }
+
+      /* ── Agent router: list agents + route a prompt to one ── */
+      if (req.method === 'GET' && pathname === '/api/agents') {
+        sendJson(res, 200, listAgents().map((a) => ({ id: a.id, name: a.name, capability: a.capability })));
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/api/route') {
+        const body = await readJsonBody(req);
+        const prompt = String(body.prompt || '').trim();
+        if (!prompt) {
+          sendJson(res, 400, { error: 'prompt is required.' });
+          return;
+        }
+        const manualAgentId = typeof body.agent === 'string' && body.agent !== 'auto' ? body.agent : undefined;
+        // Active project scopes the conversation; 'brainstorm'/empty = no project.
+        const projectName = typeof body.projectName === 'string' && body.projectName.trim() ? body.projectName.trim() : undefined;
+        const conversationId = typeof body.conversationId === 'string' && body.conversationId.trim() ? body.conversationId.trim() : undefined;
+        try {
+          const result = await routeAndDispatch(prompt, {
+            manualAgentId,
+            projectName,
+            conversationId,
+            onProgress: (m) => console.log(`[route] ${m}`),
+          });
+          sendJson(res, 200, {
+            conversationId: result.conversationId,
+            agent: result.decision.agent.id,
+            agentName: result.decision.agent.name,
+            via: result.decision.via,
+            reason: result.decision.reason,
+            outcome: result.outcome,
+            terminalState: result.terminalState ?? null,
+            output: result.output ?? null,
+            detail: result.detail,
+          });
+        } catch (err: any) {
+          sendJson(res, 500, { error: err?.message || 'Routing failed.' });
+        }
+        return;
+      }
+
+      /* ── Conversations (persisted agent interactions, filterable by project) ── */
+      if (req.method === 'GET' && pathname === '/api/conversations') {
+        const project = url.searchParams.get('project') || undefined;
+        sendJson(res, 200, getConversationStore().listConversations(project));
+        return;
+      }
+      {
+        const m = pathname.match(/^\/api\/conversations\/([^/]+)$/);
+        if (m && req.method === 'GET') {
+          const conv = getConversationStore().getWithMessages(m[1]);
+          if (!conv) { sendJson(res, 404, { error: 'Conversation not found.' }); return; }
+          sendJson(res, 200, conv);
+          return;
+        }
+      }
+
+      /* ── In-house tickets (mini-Jira): board + mobile-app API ── */
+      if (req.method === 'GET' && pathname === '/api/tickets') {
+        const store = getTicketStore();
+        const status = url.searchParams.get('status') || undefined;
+        const source = url.searchParams.get('source') || undefined;
+        const project = url.searchParams.get('project') || undefined;
+        const tickets = store.list({
+          status: status as TicketStatus | undefined,
+          source: source as ('auto' | 'manual') | undefined,
+          projectName: project,
+        });
+        sendJson(res, 200, { tickets, counts: store.countsByStatus(project) });
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/api/tickets') {
+        const body = await readJsonBody(req);
+        const title = String(body.title || '').trim();
+        if (!title) {
+          sendJson(res, 400, { error: 'title is required.' });
+          return;
+        }
+        const status = TICKET_STATUSES.includes(body.status as TicketStatus)
+          ? (body.status as TicketStatus)
+          : 'todo';
+        const priority = TICKET_PRIORITIES.includes(body.priority as TicketPriority)
+          ? (body.priority as TicketPriority)
+          : 'normal';
+        const ticket = getTicketStore().create(createEntityId('ticket'), {
+          title,
+          description: typeof body.description === 'string' ? body.description : '',
+          status,
+          source: 'manual',
+          priority,
+          projectName: typeof body.projectName === 'string' ? body.projectName : null,
+          assignee: typeof body.assignee === 'string' ? body.assignee : null,
+          tags: Array.isArray(body.tags) ? body.tags.map(String) : [],
+        });
+        notifyTicketChange({ ticket, kind: 'created' });
+        sendJson(res, 201, ticket);
+        return;
+      }
+
+      {
+        const ticketMatch = pathname.match(/^\/api\/tickets\/([^/]+)$/);
+        if (ticketMatch && (req.method === 'PATCH' || req.method === 'PUT')) {
+          const id = ticketMatch[1];
+          const store = getTicketStore();
+          const before = store.get(id);
+          if (!before) {
+            sendJson(res, 404, { error: `Ticket ${id} not found.` });
+            return;
+          }
+          const body = await readJsonBody(req);
+          const patch: Record<string, unknown> = {};
+          if (typeof body.title === 'string') patch.title = body.title;
+          if (typeof body.description === 'string') patch.description = body.description;
+          if (typeof body.assignee === 'string') patch.assignee = body.assignee;
+          if (Array.isArray(body.tags)) patch.tags = body.tags.map(String);
+          if (TICKET_STATUSES.includes(body.status as TicketStatus)) patch.status = body.status;
+          if (TICKET_PRIORITIES.includes(body.priority as TicketPriority)) patch.priority = body.priority;
+          const updated = store.update(id, patch as any);
+          if (updated) {
+            const statusChanged = updated.status !== before.status;
+            notifyTicketChange({
+              ticket: updated,
+              kind: statusChanged ? 'status' : 'updated',
+              fromStatus: statusChanged ? before.status : undefined,
+            });
+          }
+          sendJson(res, 200, updated);
+          return;
+        }
+        if (ticketMatch && req.method === 'DELETE') {
+          const id = ticketMatch[1];
+          const store = getTicketStore();
+          const before = store.get(id);
+          const ok = store.delete(id);
+          if (ok && before) notifyTicketChange({ ticket: before, kind: 'deleted' });
+          sendJson(res, ok ? 200 : 404, { ok });
+          return;
+        }
       }
 
       if (req.method === 'GET' && pathname === '/api/runs') {
@@ -2915,6 +3407,12 @@ export function startUnityHttpServer(runtime: RuntimeState) {
         return;
       }
 
+      // Live SSE stream for one run (push, no polling).
+      if (req.method === 'GET' && extractRunId(pathname, '/stream')) {
+        handleRunStream(req, res, { runId: extractRunId(pathname, '/stream') as string });
+        return;
+      }
+
       if (req.method === 'GET' && extractRunId(pathname, '/artifacts')) {
         const runId = extractRunId(pathname, '/artifacts') as string;
         sendJson(res, 200, unityStore.listArtifactsByRun(runId));
@@ -2937,11 +3435,15 @@ export function startUnityHttpServer(runtime: RuntimeState) {
           return;
         }
 
-        const abortController = runtime.startProcessing();
+        // Register under the REAL runId (and project) so /cancel can find and
+        // abort THIS run. Without the runId it was stored as a "legacy-…" key,
+        // so cancel-by-runId never matched and reported "not running".
+        const approvingRun = unityStore.getRun(runId);
+        const abortController = runtime.startProcessing(runId, approvingRun?.projectName);
         try {
           approveAutonomousRunPlan(runId, approvedBy);
         } catch (error) {
-          runtime.finishProcessing();
+          runtime.finishProcessing(runId);
           throw error;
         }
 
@@ -2971,7 +3473,7 @@ export function startUnityHttpServer(runtime: RuntimeState) {
             );
           })
           .finally(() => {
-            runtime.finishProcessing();
+            runtime.finishProcessing(runId);
           });
 
         sendJson(res, 202, {
@@ -3002,8 +3504,11 @@ export function startUnityHttpServer(runtime: RuntimeState) {
       }
 
       if (req.method === 'POST' && extractRunId(pathname, '/cancel')) {
-        if (!runtime.abortCurrentTask()) {
-          sendJson(res, 409, { error: 'No active run is currently executing.' });
+        const runId = extractRunId(pathname, '/cancel') as string;
+        // Abort the SPECIFIC run — runs execute concurrently, so without the
+        // runId this would abort whichever happened to be first (or none).
+        if (!runtime.abortCurrentTask(runId)) {
+          sendJson(res, 409, { error: 'That run is not currently executing.' });
           return;
         }
 

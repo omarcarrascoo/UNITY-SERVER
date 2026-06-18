@@ -18,6 +18,8 @@ function envPort(name: string, fallback: number): number {
 export const PORTS = {
   pm: envPort('A2A_PM_PORT', 5000),
   devSquad: envPort('A2A_DEV_SQUAD_PORT', 5001),
+  marketing: envPort('A2A_MARKETING_PORT', 5002),
+  marketResearch: envPort('A2A_MARKET_RESEARCH_PORT', 5003),
 } as const;
 
 export const HOST = '127.0.0.1';

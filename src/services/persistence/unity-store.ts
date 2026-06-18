@@ -14,6 +14,7 @@ import type {
   TaskStatus,
 } from '../../domain/orchestration.js';
 import type { AutonomousRunPolicy, NightJobConfig } from '../../domain/policies.js';
+import { runEventBus } from '../events/event-bus.js';
 
 type SqlValue = string | number | null;
 
@@ -532,12 +533,17 @@ export class UnityStore {
     message: string,
     payload?: unknown,
   ): void {
+    const createdAt = nowIso();
     this.db
       .prepare(`
         INSERT INTO events (id, run_id, task_id, level, type, message, payload, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `)
-      .run(eventId, runId, taskId, level, type, message, payload ? JSON.stringify(payload) : null, nowIso());
+      .run(eventId, runId, taskId, level, type, message, payload ? JSON.stringify(payload) : null, createdAt);
+
+    // Fan the committed event out to in-process listeners (SSE stream, etc.).
+    // Mirrors mapEvent's shape so live and replayed events are byte-identical.
+    runEventBus.publish({ id: eventId, runId, taskId, level, type, message, payload: payload ?? null, createdAt });
   }
 
   addArtifact(
